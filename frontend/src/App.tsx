@@ -177,18 +177,19 @@ function AppContent() {
       case 'dashboard':
         return (
           <Dashboard 
+          onStartOnboarding={() => setCurrentTab('onboarding')}
             onSelectEvent={(id) => {
               setActiveEventId(id);
               setWorkspaceInitialTab('overview');
               setCurrentTab('workspace');
             }}
             onOpenSources={(id) => {
-              setActiveEventId(id);
-              setWorkspaceInitialTab('sources');
-              setCurrentTab('workspace');
-            }}
-            onStartOnboarding={() => setCurrentTab('onboarding')}
+  setActiveEventId(id);
+  setWorkspaceInitialTab('sources');
+  setCurrentTab('workspace');
+}}
           />
+          
         );
       case 'events':
         return (
@@ -215,7 +216,13 @@ function AppContent() {
       case 'settings':
         return <Settings />;
       default:
-        return <Dashboard onSelectEvent={(id) => { setActiveEventId(id); setWorkspaceInitialTab('overview'); setCurrentTab('workspace'); }} onStartOnboarding={() => setCurrentTab('onboarding')} />;
+        return <Dashboard onSelectEvent={(id) => { setActiveEventId(id); setWorkspaceInitialTab('overview'); setCurrentTab('workspace'); }} onStartOnboarding={() => setCurrentTab('onboarding')} 
+        onOpenSources={(id) => {
+  setActiveEventId(id);
+  setWorkspaceInitialTab('sources');
+  setCurrentTab('workspace');
+}}/>;
+        
     }
   };
 

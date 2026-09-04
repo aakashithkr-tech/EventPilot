@@ -15,6 +15,7 @@ import { Event } from '../types';
 
 interface DashboardProps {
   onSelectEvent: (id: string) => void;
+  onOpenSources: (id: string) => void;
   onStartOnboarding: () => void;
 }
 

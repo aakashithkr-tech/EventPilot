@@ -124,7 +124,9 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onBack, onFinish }) => {
       : step));
 
     // Manual entries skip AI extraction — build parsedData directly from form input.
+    
     const result: AIAnalysisResult = {
+      
       event: {
         name: manualName,
         type: manualType,
@@ -135,6 +137,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onBack, onFinish }) => {
         healthScore: 100,
         teamSize: manualTeamSize,
         nextAction: 'Define your first milestone'
+        
       },
       deadlines: [
         { title: 'Final Submission', date: manualDeadline, type: 'official', verified: true }
@@ -146,8 +149,20 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onBack, onFinish }) => {
         name: i === 0 ? 'You' : `Teammate ${i + 1}`,
         role: i === 0 ? 'Lead' : 'Member',
         workload: 0
-      }))
-    };
+      })),
+       sourceType: 'text',
+      confidence: {
+        overall: 'high',
+        event: 'high',
+        deadlines: 'high',
+        requirements: 'high',
+        resources: 'high'
+      },
+      warnings: []
+    }
+    ;
+    
+    
 
     setTimeout(() => {
       setParsedData(result);
