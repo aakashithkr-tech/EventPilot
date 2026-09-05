@@ -51,8 +51,8 @@ async function main() {
   app.use('/api/resources', resourceRoutes);
   app.use('/api/deadlines', deadlineRoutes);
   app.use('/api/notifications', notificationRoutes);
-  app.use('/api', sourceRoutes);
   app.use('/api/whatsapp', whatsappRoutes);
+  app.use('/api', sourceRoutes);
   app.use('/api/system', systemRoutes);
 
   // Poll connected Gmail sources every 15 minutes while the server is running.
