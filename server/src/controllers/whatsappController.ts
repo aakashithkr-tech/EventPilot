@@ -137,6 +137,7 @@ export async function verifyWhatsAppWebhook(req: Request, res: Response) {
 }
 
 export async function receiveWhatsAppWebhook(req: Request & { rawBody?: Buffer }, res: Response) {
+  console.log('[whatsapp] Incoming webhook received');
   const signature = req.header('x-hub-signature-256') || '';
   if (!env.whatsappAppSecret || !signature || !req.rawBody || !signatureMatches(req.rawBody, signature, env.whatsappAppSecret)) {
     return res.sendStatus(403);
