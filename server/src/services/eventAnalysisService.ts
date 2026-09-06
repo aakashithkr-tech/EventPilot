@@ -805,18 +805,42 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
   const description = isUrl ? (extractDescription(html) || visibleText.slice(0, 500)) : visibleText.split('\n').slice(1).join(' ').slice(0, 5000);
   const combined = `${title}\n${description}\n${visibleText}`;
   const type = inferType(combined);
-  const deadlines = extractDeadlines(visibleText);
+  let deadlines = extractDeadlines(visibleText);
 
   // JSON-LD dates are useful only as additional event dates. They are not labelled deadlines,
   // so they never get silently converted into a submission deadline.
   const structuredDates = extractStructuredDates(html)
     .map((value) => parseDateCandidate(value)?.getTime())
     .filter((value): value is number => Number.isFinite(value));
-  if (deadlines.length === 0 && structuredDates.length > 0) {
-    throw new Error('I found event dates, but no clearly labelled submission/registration deadline. Please verify the deadline manually before creating the workspace.');
-  }
+
+  const deadlineWarnings: string[] = [];
+
   if (deadlines.length === 0) {
-    throw new Error('I could not find a clearly labelled event deadline on that page. Try the specific event page, upload its rulebook, or use Add Manually.');
+    // Previously this threw and forced the user into "Add Manually", even
+    // though the page usually has a real title, description, requirements,
+    // or team-size rules worth keeping. Fail soft instead: hand back
+    // everything else we found plus one unverified placeholder deadline
+    // (2 weeks out) that the confirm screen's editable date field lets the
+    // user fix in one click, rather than losing all extracted context.
+    if (structuredDates.length > 0) {
+      deadlineWarnings.push(
+        'I found event dates on the page, but none were clearly labelled as a registration or submission deadline — please verify the date below.'
+      );
+    } else {
+      deadlineWarnings.push(
+        'I could not find a clearly labelled deadline on that page — please verify the date below, or check the specific event/rules page for the exact date.'
+      );
+    }
+    const fallback = new Date();
+    fallback.setUTCDate(fallback.getUTCDate() + 14);
+    deadlines = [
+      {
+        title: 'Event Deadline (please verify)',
+        date: normalizeDate(fallback),
+        type: 'official',
+        verified: false,
+      },
+    ];
   }
 
   // Prefer the actual submission/code-freeze milestone as the workspace's
@@ -849,7 +873,7 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
   const participation = inferParticipation(combined);
   const teamSize = participation.teamSize;
 
-  const warnings: string[] = [];
+  const warnings: string[] = [...deadlineWarnings];
   if (!extractMeta(html, 'og:title') && !/<title/i.test(html)) warnings.push('Event name came from the page URL.');
   if (requirements.length === 0) warnings.push('No clear requirements section was found; review the event page before creating the workspace.');
   if (resources.length === 0) warnings.push('No linked guidelines/templates were detected on the page.');
@@ -857,7 +881,8 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
     warnings.push('No explicit team-size limit was detected.');
   }
 
-  const confidenceScore = (deadlines.length > 0 ? 1 : 0) + (requirements.length > 0 ? 1 : 0) + (resources.length > 0 ? 1 : 0) + (title !== 'Untitled Event' ? 1 : 0);
+  const hasVerifiedDeadline = deadlineWarnings.length === 0;
+  const confidenceScore = (hasVerifiedDeadline ? 1 : 0) + (requirements.length > 0 ? 1 : 0) + (resources.length > 0 ? 1 : 0) + (title !== 'Untitled Event' ? 1 : 0);
   const overall: EventAnalysisResult['confidence']['overall'] = confidenceScore >= 4 ? 'high' : confidenceScore >= 2 ? 'medium' : 'low';
 
   return {
@@ -885,7 +910,7 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
     confidence: {
       overall,
       event: title !== 'Untitled Event' ? 'high' : 'low',
-      deadlines: deadlines.length > 0 ? 'high' : 'low',
+      deadlines: hasVerifiedDeadline ? 'high' : 'low',
       requirements: requirements.length > 0 ? 'high' : 'low',
       resources: resources.length > 0 ? 'high' : 'low',
     },

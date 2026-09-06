@@ -660,28 +660,60 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onBack, onFinish }) => {
 
               {/* Team Settings */}
               <div>
-                <label style={labelFormStyle}>Expected Team size</label>
+                <label style={labelFormStyle}>Number of Members</label>
                 {parsedData.event.participationDetails && (
                   <p style={{ fontSize: '0.72rem', color: 'var(--text-tertiary)', margin: '0.15rem 0 0.5rem' }}>
                     Detected from source: {parsedData.event.participationDetails}
+                    {' '}(allowed: {teamSizeMin === teamSizeMax ? `${teamSizeMin} only` : `${teamSizeMin}–${teamSizeMax}`})
                   </p>
                 )}
                 <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-                  <span style={{ fontSize: '0.72rem', color: 'var(--text-tertiary)', minWidth: '14px' }}>{teamSizeMin}</span>
-                  <input
-                    type="range"
-                    min={teamSizeMin}
-                    max={teamSizeMax}
-                    value={teamSize}
-                    onChange={e => setTeamSize(parseInt(e.target.value))}
-                    disabled={teamSizeMin === teamSizeMax}
-                    style={{ flex: 1, accentColor: 'var(--primary)' }}
-                  />
-                  <span style={{ fontSize: '0.72rem', color: 'var(--text-tertiary)', minWidth: '14px' }}>{teamSizeMax}</span>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minWidth: '80px', justifyContent: 'flex-end' }}>
-                    <User size={14} style={{ color: 'var(--text-secondary)' }} />
-                    <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>{teamSize} members</span>
+                  {/* Stepper: locked to the range the event itself specifies, so it can
+                      never go below teamSizeMin or above teamSizeMax. */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', borderRadius: '8px', padding: '0.4rem 0.6rem' }}>
+                    <button
+                      type="button"
+                      onClick={() => setTeamSize(prev => Math.max(teamSizeMin, prev - 1))}
+                      disabled={teamSize <= teamSizeMin}
+                      className="btn-icon"
+                      style={{
+                        width: '28px',
+                        height: '28px',
+                        border: '1px solid var(--border-color)',
+                        opacity: teamSize <= teamSizeMin ? 0.4 : 1,
+                        cursor: teamSize <= teamSizeMin ? 'not-allowed' : 'pointer',
+                      }}
+                      aria-label="Decrease member count"
+                    >
+                      −
+                    </button>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minWidth: '90px', justifyContent: 'center' }}>
+                      <User size={14} style={{ color: 'var(--text-secondary)' }} />
+                      <span style={{ fontSize: '0.9rem', fontWeight: 700 }}>{teamSize}</span>
+                      <span style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)' }}>
+                        member{teamSize === 1 ? '' : 's'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setTeamSize(prev => Math.min(teamSizeMax, prev + 1))}
+                      disabled={teamSize >= teamSizeMax}
+                      className="btn-icon"
+                      style={{
+                        width: '28px',
+                        height: '28px',
+                        border: '1px solid var(--border-color)',
+                        opacity: teamSize >= teamSizeMax ? 0.4 : 1,
+                        cursor: teamSize >= teamSizeMax ? 'not-allowed' : 'pointer',
+                      }}
+                      aria-label="Increase member count"
+                    >
+                      +
+                    </button>
                   </div>
+                  <span style={{ fontSize: '0.72rem', color: 'var(--text-tertiary)' }}>
+                    Min {teamSizeMin} · Max {teamSizeMax}
+                  </span>
                 </div>
               </div>
             </div>
