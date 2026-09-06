@@ -49,38 +49,50 @@ export const createInvitation = asyncHandler(async (req: AuthedRequest, res: Res
     throw new AppError('This person is already on the team', 409, 'CONFLICT');
   }
 
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
   const existingInvite = await EventInvitation.findOne({
     eventId: event._id,
     email: normalizedEmail,
     status: 'pending',
   });
-  if (existingInvite) {
-    throw new AppError('An invitation is already pending for this email', 409, 'CONFLICT');
-  }
-
-  const invitation = await EventInvitation.create({
-    eventId: event._id,
-    email: normalizedEmail,
-    invitedByUserId: req.userId,
-    role: role || 'member',
-  });
 
   const inviter = await User.findById(req.userId).select('name');
 
-  // Invitations are delivered inside EventPilot. If the target already has
-  // an account, create a real, actionable notification in that user's inbox.
-  // No email is required for the team-request flow.
-  {
-    await Notification.create({
-      userId: existingUser._id,
+  let invitation;
+  if (existingInvite) {
+    // A pending invite for this email already exists — most likely from
+    // before the notification delivery was fixed, so the invitee may never
+    // have actually seen it. Treat this as a "resend": refresh its expiry
+    // and role, then re-create the notification below, instead of just
+    // bouncing the sender with a 409 every time they retry.
+    existingInvite.role = role || existingInvite.role;
+    existingInvite.expiresAt = new Date(Date.now() + SEVEN_DAYS_MS);
+    await existingInvite.save();
+    invitation = existingInvite;
+  } else {
+    invitation = await EventInvitation.create({
       eventId: event._id,
-      title: 'Team Invitation',
-      message: `${inviter?.name || 'A teammate'} invited you to join ${event.name} as ${role || 'member'}.`,
-      type: 'info',
-      invitationId: invitation._id,
-      createdBy: req.userId,
+      email: normalizedEmail,
+      invitedByUserId: req.userId,
+      role: role || 'member',
     });
   }
+
+  // Invitations are delivered inside EventPilot. If the target already has
+  // an account, create a real, actionable notification in that user's inbox.
+  // No email is required for the team-request flow. Always (re)create this
+  // — including on resend — so a stuck/never-delivered invite can be
+  // recovered from just by clicking "Send Invitation" again.
+  await Notification.create({
+    userId: existingUser._id,
+    eventId: event._id,
+    title: existingInvite ? 'Team Invitation (Reminder)' : 'Team Invitation',
+    message: `${inviter?.name || 'A teammate'} invited you to join ${event.name} as ${invitation.role}.`,
+    type: 'info',
+    invitationId: invitation._id,
+    createdBy: req.userId,
+  });
 
   res.status(201).json({ success: true, data: { invitation: invitation.toJSON() } });
 });
