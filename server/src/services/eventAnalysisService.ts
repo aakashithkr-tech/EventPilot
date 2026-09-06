@@ -136,16 +136,23 @@ function inferTeamSize(text: string): number {
     /(?:maximum|max\.?|up\s+to)\s*(\d+)\s*(?:members?|participants?)/i,
     /(?:minimum|min\.?)\s*(\d+)\s*(?:members?|participants?)/i,
   ];
+
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (!match) continue;
+
     const a = Number(match[1]);
     const b = match[2] ? Number(match[2]) : a;
-    if (Number.isFinite(a) && Number.isFinite(b)) return Math.max(1, Math.round((a + b) / 2));
+
+    if (Number.isFinite(a) && Number.isFinite(b)) {
+      // Keep the existing numeric schema intact: use the maximum team size.
+      // The UI can later expose the full range if min/max fields are added.
+      return Math.max(1, b);
+    }
   }
+
   return 1;
 }
-
 function inferSourceYear(text: string): number {
   const years = [...text.matchAll(/\b(20\d{2})\b/g)].map((match) => Number(match[1]));
   if (years.length > 0) {
@@ -261,14 +268,23 @@ function extractDeadlines(text: string): AnalyzedDeadline[] {
   const lines = normalizedText.split(/\r?\n/).map(cleanText).filter(Boolean);
   const sourceYear = inferSourceYear(normalizedText);
   const candidates: Array<AnalyzedDeadline & { key: string; priority: number; order: number }> = [];
-  const keyword = /registration|application|submission|deadline|closing|close|proposal|abstract|presentation|speaker|final|last date|due|event start|event end/i;
+
+  // Event pages use many different labels. Keep the label broad here and
+  // normalize it later with extractDeadlineTitle/deadlineKey.
+  const keyword = /registration|application|submission|deadline|closing|close|proposal|abstract|presentation|speaker|final|last date|due|event start|event end|judging|team formation|specification|code freeze|write up|winners?/i;
 
   const addCandidate = (labelSource: string, rawDate: string, order: number) => {
     const date = parseDateCandidate(rawDate, sourceYear);
     if (!date || Number.isNaN(date.getTime())) return;
 
-    const title = extractDeadlineTitle(labelSource.replace(rawDate, '').trim());
+    const cleanedLabel = cleanText(labelSource)
+      .replace(rawDate, ' ')
+      .replace(/\b(?:at|on|by|until)\s*$/i, '')
+      .trim();
+
+    const title = extractDeadlineTitle(cleanedLabel);
     const key = deadlineKey(title);
+
     candidates.push({
       title,
       date: normalizeDate(date),
@@ -280,7 +296,11 @@ function extractDeadlines(text: string): AnalyzedDeadline[] {
     });
   };
 
-  // 1) Normal DOM structure: milestone label and date appear on nearby lines.
+  const hasDate = (value: string) => (value.match(dateRegex()) || []).length > 0;
+  const isTimeOnly = (value: string) => /^\d{1,2}:\d{2}\s*(?:AM|PM)(?:\s*[A-Z]{2,5})?$/i.test(value);
+
+  // 1) Normal DOM structure.
+  // Pair a milestone only with a real date. Never use a time-only line.
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!keyword.test(line)) continue;
@@ -295,119 +315,170 @@ function extractDeadlines(text: string): AnalyzedDeadline[] {
       const next = lines[i + offset];
       if (!next) break;
 
+      if (isTimeOnly(next)) continue;
+
       const match = next.match(dateRegex());
       if (match?.[0]) {
-        // A date line may contain a time after it; parseDateCandidate only needs the date.
         addCandidate(line, match[0], i);
         break;
       }
 
-      // Time-only DOM rows are not dates and must never be paired with another milestone.
-      if (/^\d{1,2}:\d{2}\s*(?:AM|PM)$/i.test(next)) continue;
-
-      // Do not let one milestone steal another milestone's date.
+      // Once another labelled milestone begins, this milestone has no date
+      // in its own block. Do not steal the next milestone's date.
       if (offset > 1 && keyword.test(next)) break;
     }
   }
 
-  // 2) Flattened/SPA text fallback.
-  // Some React/Next event pages return body.innerText as one long string rather than
-  // preserving the visual timeline rows. In that case, pair each milestone label with
-  // the FIRST date occurring after it, stopping before another milestone label.
+  // 2) Flattened SPA/React text.
+  // Some event pages collapse the timeline into a single line. Treat each
+  // known milestone as a boundary and search only inside that milestone's
+  // local window.
   const flat = cleanText(normalizedText);
-  const milestoneRegex = /(registration\s+(?:opens?|open|starts?|begins?|closes?|closing|deadline)|application\s+(?:deadline|closes?|closing)|(?:event\s+)?starts?|(?:event\s+)?ends?|final\s+submission(?:\s+deadline)?|submission\s+deadline|proposal\s+(?:submission|deadline)|abstract\s+(?:submission|deadline)|presentation\s+(?:submission|deadline)|speaker\s+(?:deadline|submission))/ig;
-  const matches = [...flat.matchAll(milestoneRegex)];
+  const milestoneRegex =
+    /(registration\s+(?:opens?|open|starts?|begins?|closes?|closing|deadline)|application\s+(?:deadline|closes?|closing)|hackathon\s+(?:begins?|starts?|ends?)|event\s+(?:starts?|ends?)|final\s+submission(?:\s+deadline)?|code\s+freeze(?:\s+and\s+submission\s+deadline)?|submission\s+(?:deadline|closes?|closing)|proposal\s+(?:submission|deadline)|abstract\s+(?:submission|deadline)|presentation\s+(?:submission|deadline)|speaker\s+(?:deadline|submission)|judging\s+(?:panel\s+announced|window)|team\s+formation|full\s+specification\s+published|write\s*up\s+quest\s+closes?|winners?\s+announced)/ig;
 
+  const matches = [...flat.matchAll(milestoneRegex)];
   for (let i = 0; i < matches.length; i++) {
     const match = matches[i];
     const label = match[0];
     const start = (match.index ?? 0) + label.length;
-    const end = matches[i + 1]?.index ?? Math.min(flat.length, start + 180);
+    const end = matches[i + 1]?.index ?? Math.min(flat.length, start + 220);
     const window = flat.slice(start, end);
+
     const dateMatch = window.match(dateRegex());
-    if (dateMatch?.[0]) addCandidate(label, dateMatch[0], i);
+    if (dateMatch?.[0]) {
+      addCandidate(label, dateMatch[0], i);
+    }
   }
 
-  // 3) Common sentence form: "Registration closes on Sep 15, 2026, 11:59 PM".
-  const sentenceRegex = /(registration|application|submission|proposal|abstract|presentation|speaker|event)[^.!?\n]{0,100}?(?:on|by|until|:)?\s*(\d{1,2}\s+[A-Za-z]+(?:,?\s+\d{4})?|[A-Za-z]+\s+\d{1,2}(?:,?\s+\d{4})?|\d{4}-\d{2}-\d{2}|\d{1,2}[\/-]\d{1,2}[\/-]\d{4})/gi;
+  // 3) Sentence-style fallback.
+  // Example: "Code freeze and submission deadline: September 28, 2026".
+  const sentenceRegex =
+    /((?:registration|application|hackathon|event|submission|proposal|abstract|presentation|speaker|judging|team formation|full specification|code freeze|write\s*up quest|winners?)[^.!?\n]{0,100}?)(?:on|by|until|at|:)\s*((?:\d{1,2}\s+[A-Za-z]+(?:,?\s+\d{4})?|[A-Za-z]+\s+\d{1,2}(?:,?\s+\d{4})?|\d{4}-\d{2}-\d{2}|\d{1,2}[\/-]\d{1,2}[\/-]\d{4}))/gi;
+
   for (const match of flat.matchAll(sentenceRegex)) {
     if (match[1] && match[2]) addCandidate(match[1], match[2], 10000);
   }
 
-  // One canonical value per logical milestone. Prefer the latest announced date;
-  // when the date is identical, prefer the more specific/stronger label.
+  // 4) Deduplicate by logical milestone.
+  // Prefer a later announced value for the same milestone, but do not let a
+  // different milestone replace it.
   const best = new Map<string, typeof candidates[number]>();
   for (const candidate of candidates) {
     const existing = best.get(candidate.key);
-    if (!existing || candidate.date > existing.date ||
-        (candidate.date === existing.date && candidate.priority > existing.priority)) {
+    if (
+      !existing ||
+      candidate.date > existing.date ||
+      (candidate.date === existing.date && candidate.priority > existing.priority)
+    ) {
       best.set(candidate.key, candidate);
     }
   }
 
   return [...best.values()]
     .sort((a, b) => a.date.localeCompare(b.date))
-    .slice(0, 20)
+    .slice(0, 30)
     .map(({ key: _key, priority: _priority, order: _order, ...deadline }) => deadline);
 }
-
 function extractRequirements(text: string, sourceUrl?: string): AnalyzedRequirement[] {
-  const lines = text.split('\n').map(cleanText).filter(Boolean);
+  const normalizedText = decodeHtml(text).replace(/\u00a0/g, ' ');
+  const lines = normalizedText.split(/\r?\n/).map(cleanText).filter(Boolean);
   const found = new Map<string, AnalyzedRequirement>();
-  const heading = /requirement|eligib|what to submit|submission checklist|deliverable|documents required|judging criteria|evaluation criteria/i;
-  let inSection = false;
-  let sectionTitle = 'Event Requirements';
-  let remaining = 0;
 
-  for (const line of lines) {
-    if (heading.test(line) && line.length < 120) {
-      inSection = true;
-      sectionTitle = line;
-      remaining = 25;
-      continue;
-    }
-    if (inSection && remaining-- > 0) {
-      if (/^(deadline|schedule|contact|faq|about|prizes?)\b/i.test(line)) {
-        inSection = false;
-        continue;
-      }
-      const candidate = line.replace(/^[\s•*\-–—✓✔☐☑\d.)]+\s*/, '').trim();
-      if (candidate.length < 4 || candidate.length > 160) continue;
-      if (!/[A-Za-z]/.test(candidate)) continue;
-      if (/^(?:official\s+)?(?:guidelines?|rulebook|rules|template|starter\s+kit|handbook|brochure|schedule|resource|download)\b/i.test(candidate)) continue;
-      if (/^(requirements?|eligibility|submission|details?)$/i.test(candidate)) continue;
-      const key = candidate.toLowerCase();
-      found.set(key, {
-        title: candidate,
-        completed: false,
-        requiredBy: sectionTitle,
-        ...(sourceUrl ? { sourceLink: sourceUrl } : {}),
-        verified: true,
-      });
-    }
-  }
+  const sectionHeading =
+    /^(?:what you need to submit|what to submit|submission checklist|submission requirements?|requirements?|deliverables?|documents required|judging criteria|evaluation criteria|eligibility|rules?)$/i;
 
-  // A second pass catches common "must submit / submit X" statements outside headings.
-  for (const line of lines) {
-    const match = line.match(/(?:must\s+(?:submit|provide|upload)|submit|provide|upload)\s+([^.;]{4,120})/i);
-    if (!match) continue;
-    const candidate = match[1].trim().replace(/[.!]+$/, '');
-    if (/^(your|the)\s+(application|details|information)$/i.test(candidate)) continue;
+  const addRequirement = (value: string, requiredBy: string) => {
+    const candidate = cleanText(
+      value
+        .replace(/^[\s•*\-–—✓✔☐☑\d.)]+/, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+    );
+
+    if (candidate.length < 4 || candidate.length > 220) return;
+    if (!/[A-Za-z]/.test(candidate)) return;
+
+    if (/^(requirements?|eligibility|submission|details?|rules?|guidelines?|judging criteria|evaluation criteria)$/i.test(candidate)) {
+      return;
+    }
+
     const key = candidate.toLowerCase();
     if (!found.has(key)) {
       found.set(key, {
         title: candidate,
         completed: false,
-        requiredBy: 'Submission Instructions',
+        requiredBy,
         ...(sourceUrl ? { sourceLink: sourceUrl } : {}),
         verified: true,
       });
     }
+  };
+
+  // 1) Line-oriented sections.
+  let inSection = false;
+  let remaining = 0;
+  let sectionTitle = 'Event Requirements';
+
+  for (const line of lines) {
+    const isHeading = sectionHeading.test(line) ||
+      /what you need to submit|submission requirements?|submission checklist|deliverables?|documents required/i.test(line) && line.length < 140;
+
+    if (isHeading) {
+      inSection = true;
+      sectionTitle = line;
+      remaining = 40;
+      continue;
+    }
+
+    if (inSection) {
+      if (remaining-- <= 0) {
+        inSection = false;
+        continue;
+      }
+
+      if (/^(important dates|timeline|schedule|contact|faq|about|prizes?|register|registration)\b/i.test(line)) {
+        inSection = false;
+        continue;
+      }
+
+      addRequirement(line, sectionTitle);
+    }
   }
 
-  return [...found.values()].slice(0, 30);
-}
+  // 2) Flattened Unstop/React text.
+  // Capture content after "What You Need to Submit" until the next major
+  // section heading. Split common bullet markers and punctuation into items.
+  const flat = cleanText(normalizedText);
+  const flattenedSection =
+    /what\s+you\s+need\s+to\s+submit|what\s+to\s+submit|submission\s+requirements?|submission\s+checklist/i;
 
+  const sectionMatch = flat.match(flattenedSection);
+  if (sectionMatch && sectionMatch.index !== undefined) {
+    const start = sectionMatch.index + sectionMatch[0].length;
+    const tail = flat.slice(start);
+    const stop =
+      tail.search(/\b(?:important dates|timeline|judging criteria|prizes?|eligibility|about hackathon|faq|contact)\b/i);
+    const section = tail.slice(0, stop >= 0 ? stop : 1800);
+
+    for (const item of section.split(/\s*(?:•|·|▪|◦|\||;)\s*/)) {
+      addRequirement(item, sectionMatch[0]);
+    }
+  }
+
+  // 3) Explicit instruction sentences.
+  const instructionRegex =
+    /(?:must\s+(?:submit|provide|upload)|submit|provide|upload|include|requires?)\s+([^.;]{4,180})/gi;
+
+  for (const match of flat.matchAll(instructionRegex)) {
+    const candidate = match[1]?.trim();
+    if (!candidate) continue;
+    if (/^(your|the)\s+(application|details|information)$/i.test(candidate)) continue;
+    addRequirement(candidate, 'Submission Instructions');
+  }
+
+  return [...found.values()].slice(0, 40);
+}
 function extractResources(html: string, sourceUrl: string): AnalyzedResource[] {
   const found = new Map<string, AnalyzedResource>();
   const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
@@ -591,10 +662,29 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
     throw new Error('I could not find a clearly labelled event deadline on that page. Try the specific event page, upload its rulebook, or use Add Manually.');
   }
 
-  const finalCandidates = deadlines.filter((d) => /final|submission|deadline|closing|last/i.test(d.title));
-  const sortedFinalCandidates = [...(finalCandidates.length ? finalCandidates : deadlines)]
-    .sort((a, b) => a.date.localeCompare(b.date));
-  const finalDeadline = sortedFinalCandidates[sortedFinalCandidates.length - 1].date;
+  // Prefer the actual submission/code-freeze milestone as the workspace's
+  // primary deadline. Registration deadlines and post-submission activities
+  // such as judging or winner announcements must not override it.
+  const submissionCandidates = deadlines.filter((d) =>
+    /submission|code freeze|final submission/i.test(d.title) &&
+    !/registration/i.test(d.title)
+  );
+
+  const deadlineCandidates = deadlines.filter((d) =>
+    /deadline|due|closing|close|last date/i.test(d.title) &&
+    !/registration/i.test(d.title)
+  );
+
+  const finalCandidates =
+    submissionCandidates.length > 0
+      ? submissionCandidates
+      : deadlineCandidates.length > 0
+        ? deadlineCandidates
+        : deadlines;
+
+  const finalDeadline = [...finalCandidates]
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .at(-1)!.date;
 
 
   const requirements = extractRequirements(visibleText, finalUrl);
