@@ -36,6 +36,10 @@ export interface EventAnalysisResult {
     progress: number;
     healthScore: number;
     teamSize: number;
+    teamSizeMin: number;
+    teamSizeMax: number;
+    individualAllowed: boolean;
+    participationDetails: string;
     nextAction: string;
   };
   deadlines: AnalyzedDeadline[];
@@ -129,30 +133,114 @@ function inferType(text: string): EventAnalysisResult['event']['type'] {
   return 'hackathon';
 }
 
-function inferTeamSize(text: string): number {
-  const patterns = [
-    /team(?:\s+size|\s+of)?\s*[:=-]?\s*(\d+)\s*(?:-|to)\s*(\d+)/i,
-    /teams?\s+of\s+(\d+)\s*(?:-|to)\s*(\d+)/i,
-    /(?:maximum|max\.?|up\s+to)\s*(\d+)\s*(?:members?|participants?)/i,
-    /(?:minimum|min\.?)\s*(\d+)\s*(?:members?|participants?)/i,
+function inferParticipation(text: string): {
+  teamSize: number;
+  teamSizeMin: number;
+  teamSizeMax: number;
+  individualAllowed: boolean;
+  participationDetails: string;
+} {
+  const value = cleanText(text);
+
+  // Explicit solo/individual participation.
+  const individualAllowed =
+    /\b(?:individual|solo|single[-\s]?participant|participate\s+(?:alone|individually))\b/i.test(value) &&
+    !/\b(?:not\s+allowed|not\s+permitted|only\s+teams?|teams?\s+only)\b/i.test(value);
+
+  // Prefer explicit ranges such as "1-4 members", "2 to 4 members",
+  // "teams of 2–4", or "team size: 2-4".
+  const rangePatterns = [
+    /\bteam(?:\s+size|\s+of)?\s*[:=-]?\s*(\d+)\s*(?:-|–|—|to)\s*(\d+)\s*(?:members?|participants?|people)?\b/i,
+    /\bteams?\s+of\s+(\d+)\s*(?:-|–|—|to)\s*(\d+)\s*(?:members?|participants?|people)?\b/i,
+    /\b(\d+)\s*(?:-|–|—|to)\s*(\d+)\s*(?:members?|participants?)\b/i,
   ];
 
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
+  for (const pattern of rangePatterns) {
+    const match = value.match(pattern);
     if (!match) continue;
 
     const a = Number(match[1]);
-    const b = match[2] ? Number(match[2]) : a;
+    const b = Number(match[2]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
 
-    if (Number.isFinite(a) && Number.isFinite(b)) {
-      // Keep the existing numeric schema intact: use the maximum team size.
-      // The UI can later expose the full range if min/max fields are added.
-      return Math.max(1, b);
+    const min = Math.min(a, b);
+    const max = Math.max(a, b);
+
+    return {
+      teamSize: max,
+      teamSizeMin: min,
+      teamSizeMax: max,
+      individualAllowed,
+      participationDetails: individualAllowed
+        ? `Individual or teams of ${min}–${max} members`
+        : `Teams of ${min}–${max} members`,
+    };
+  }
+
+  // "Up to N members" means 1..N unless individual participation is
+  // explicitly disallowed.
+  const upTo = value.match(
+    /\b(?:maximum|max\.?|up\s+to|at\s+most)\s*(\d+)\s*(?:members?|participants?|people)\b/i
+  );
+  if (upTo) {
+    const max = Number(upTo[1]);
+    if (Number.isFinite(max)) {
+      const min = individualAllowed ? 1 : 2;
+      return {
+        teamSize: max,
+        teamSizeMin: min,
+        teamSizeMax: max,
+        individualAllowed,
+        participationDetails: individualAllowed
+          ? `Individual or teams of up to ${max} members`
+          : `Teams of up to ${max} members`,
+      };
     }
   }
 
-  return 1;
+  // Fixed "team size: 4", "4 members per team", etc.
+  const fixed = value.match(
+    /\b(?:team\s+size|teams?\s+of|team\s+of)\s*[:=-]?\s*(\d+)\s*(?:members?|participants?|people)\b/i
+  ) || value.match(/\b(\d+)\s*(?:members?|participants?|people)\s+per\s+team\b/i);
+
+  if (fixed) {
+    const size = Number(fixed[1]);
+    if (Number.isFinite(size)) {
+      return {
+        teamSize: size,
+        teamSizeMin: size,
+        teamSizeMax: size,
+        individualAllowed,
+        participationDetails: individualAllowed
+          ? `Individual or teams of ${size} members`
+          : `${size} members per team`,
+      };
+    }
+  }
+
+  if (individualAllowed) {
+    return {
+      teamSize: 1,
+      teamSizeMin: 1,
+      teamSizeMax: 1,
+      individualAllowed: true,
+      participationDetails: 'Individual participation allowed',
+    };
+  }
+
+  return {
+    teamSize: 1,
+    teamSizeMin: 1,
+    teamSizeMax: 1,
+    individualAllowed: false,
+    participationDetails: 'Team size not explicitly detected',
+  };
 }
+
+function inferTeamSize(text: string): number {
+  return inferParticipation(text).teamSize;
+}
+
 function inferSourceYear(text: string): number {
   const years = [...text.matchAll(/\b(20\d{2})\b/g)].map((match) => Number(match[1]));
   if (years.length > 0) {
@@ -541,8 +629,14 @@ async function fetchUrl(url: string): Promise<{ html: string; finalUrl: string }
       signal: controller.signal,
       redirect: 'follow',
       headers: {
-        'User-Agent': 'EventPilot/1.0 (+event-analysis)',
-        Accept: 'text/html,application/xhtml+xml',
+        // Many event platforms (Unstop, Devpost, Cloudflare-protected sites, etc.)
+        // block requests from an obviously-non-browser User-Agent like
+        // "EventPilot/1.0" with a 403/999. Presenting as a normal desktop
+        // Chrome request drastically reduces false "could not fetch" failures.
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
       },
     });
     if (!response.ok) throw new Error(`The event page returned HTTP ${response.status}.`);
@@ -574,12 +668,21 @@ async function renderUrl(url: string): Promise<{ html: string; text: string; fin
     // Playwright is intentionally loaded lazily so text-only analysis and
     // normal HTML pages do not pay the browser startup cost.
     const playwright = require('playwright');
-    browser = await playwright.chromium.launch({ headless: true });
+    browser = await playwright.chromium.launch({
+      headless: true,
+      // Most hosting platforms (Render, Railway, Docker containers in
+      // general, etc.) run the Node process as root inside a container
+      // without the kernel namespaces Chromium's sandbox needs. Without
+      // these flags, launch() throws "No usable sandbox!" in production
+      // even though it works fine on a local dev machine. --disable-dev-shm-usage
+      // avoids a separate crash on hosts with a tiny /dev/shm.
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    });
     const page = await browser.newPage({
       viewport: { width: 1440, height: 1200 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36 EventPilot/1.0',
     });
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await page.waitForLoadState('networkidle', { timeout: 12_000 }).catch(() => undefined);
     await page.waitForTimeout(1_500);
     const bodyText = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
@@ -597,6 +700,12 @@ async function renderUrl(url: string): Promise<{ html: string; text: string; fin
     const message = error instanceof Error ? error.message : String(error);
     if (/Cannot find module ['"]playwright['"]/.test(message)) {
       throw new Error('This event page needs browser rendering. Run "npm install" in server and then "npx playwright install chromium" once.');
+    }
+    if (/Executable doesn't exist|download new browsers/i.test(message)) {
+      throw new Error('The Chromium browser used to read JS-rendered event pages is missing on this server. Run "npx playwright install --with-deps chromium" in the server directory and redeploy.');
+    }
+    if (/error while loading shared libraries|missing dependencies|libnss3|libatk/i.test(message)) {
+      throw new Error('The server is missing system libraries Chromium needs. Run "npx playwright install-deps chromium" (or use a base image with those libraries) and redeploy.');
     }
     throw new Error(`The event page could not be rendered: ${message}`);
   } finally {
@@ -689,13 +798,16 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
 
   const requirements = extractRequirements(visibleText, finalUrl);
   const resources = finalUrl ? extractResources(html, finalUrl) : [];
-  const teamSize = inferTeamSize(combined);
+  const participation = inferParticipation(combined);
+  const teamSize = participation.teamSize;
 
   const warnings: string[] = [];
   if (!extractMeta(html, 'og:title') && !/<title/i.test(html)) warnings.push('Event name came from the page URL.');
   if (requirements.length === 0) warnings.push('No clear requirements section was found; review the event page before creating the workspace.');
   if (resources.length === 0) warnings.push('No linked guidelines/templates were detected on the page.');
-  if (teamSize === 1 && !/\b1\s*(?:member|participant)|individual|solo/i.test(combined)) warnings.push('No explicit team-size limit was detected.');
+  if (participation.teamSizeMax === 1 && !participation.individualAllowed) {
+    warnings.push('No explicit team-size limit was detected.');
+  }
 
   const confidenceScore = (deadlines.length > 0 ? 1 : 0) + (requirements.length > 0 ? 1 : 0) + (resources.length > 0 ? 1 : 0) + (title !== 'Untitled Event' ? 1 : 0);
   const overall: EventAnalysisResult['confidence']['overall'] = confidenceScore >= 4 ? 'high' : confidenceScore >= 2 ? 'medium' : 'low';
@@ -712,6 +824,10 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
       progress: 0,
       healthScore: 100,
       teamSize,
+      teamSizeMin: participation.teamSizeMin,
+      teamSizeMax: participation.teamSizeMax,
+      individualAllowed: participation.individualAllowed,
+      participationDetails: participation.participationDetails,
       nextAction: 'Review extracted event details before creating the workspace',
     },
     deadlines,

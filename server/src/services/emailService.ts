@@ -2,8 +2,12 @@ import { env } from '../config/env';
 
 let transporter: any = null;
 
+export function isEmailConfigured(): boolean {
+  return Boolean(env.smtpHost && env.smtpUser && env.smtpPassword);
+}
+
 async function getTransporter() {
-  if (!env.smtpHost || !env.smtpUser || !env.smtpPassword) return null;
+  if (!isEmailConfigured()) return null;
   if (!transporter) {
     const nodemailer = require('nodemailer');
     transporter = nodemailer.createTransport({

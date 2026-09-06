@@ -3,10 +3,11 @@ import { EventInvitation, INVITABLE_ROLES } from '../models/EventInvitation';
 import { EventMembership } from '../models/EventMembership';
 import { Event } from '../models/Event';
 import { User } from '../models/User';
+import { Notification } from '../models/Notification';
 import { AppError, asyncHandler } from '../middleware/errorMiddleware';
 import { AuthedRequest } from '../middleware/authMiddleware';
 import { loadAuthorizedEvent, ensureEventMember, isValidObjectId } from '../utils/eventAccess';
-import { sendTeamInvitationEmail } from '../services/emailService';
+import { sendTeamInvitationEmail, isEmailConfigured } from '../services/emailService';
 import { env } from '../config/env';
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -76,8 +77,40 @@ export const createInvitation = asyncHandler(async (req: AuthedRequest, res: Res
   } catch (error) {
     console.warn('[email] Team invitation email failed:', error instanceof Error ? error.message : error);
   }
+  if (!isEmailConfigured()) {
+    // Not an error — just tells whoever is reading the server logs why no
+    // invite email went out, instead of it silently looking like nothing happened.
+    console.warn('[email] SMTP is not configured (SMTP_HOST/SMTP_USER/SMTP_PASSWORD). Invitation emails will not be delivered until it is set.');
+  }
 
-  res.status(201).json({ success: true, data: { invitation: invitation.toJSON(), emailSent } });
+  // The invited person previously had NO way to find out about the invite unless
+  // the invitation email actually arrived (and it silently never did whenever SMTP
+  // wasn't configured, or landed in spam). If they already have an EventPilot
+  // account, also drop a real in-app notification into their account so they see
+  // it in the Notifications tab the next time they log in, regardless of email delivery.
+  if (existingUser) {
+    try {
+      await Notification.create({
+        userId: existingUser._id,
+        eventId: event._id,
+        title: 'New team invitation',
+        message: `${inviter?.name || 'A teammate'} invited you to join ${event.name} as ${role || 'member'}. Open your invitations to accept or decline.`,
+        type: 'info',
+        createdBy: req.userId,
+      });
+    } catch (error) {
+      console.warn('[notification] Failed to create in-app invitation notification:', error instanceof Error ? error.message : error);
+    }
+  }
+
+  res.status(201).json({
+    success: true,
+    data: {
+      invitation: invitation.toJSON(),
+      emailSent,
+      emailConfigured: isEmailConfigured(),
+    },
+  });
 });
 
 export const listEventInvitations = asyncHandler(async (req: AuthedRequest, res: Response) => {
@@ -158,6 +191,22 @@ export const acceptInvitation = asyncHandler(async (req: AuthedRequest, res: Res
 
   invitation.status = 'accepted';
   await invitation.save();
+
+  // Let the person who sent the invite know it was accepted — previously
+  // the inviter had no way to find out short of manually re-checking the
+  // team list.
+  try {
+    await Notification.create({
+      userId: invitation.invitedByUserId,
+      eventId: event._id,
+      title: 'Invitation accepted',
+      message: `${user.name || user.email} accepted your invite and joined ${event.name}.`,
+      type: 'success',
+      createdBy: req.userId,
+    });
+  } catch (error) {
+    console.warn('[notification] Failed to notify inviter of accepted invitation:', error instanceof Error ? error.message : error);
+  }
 
   res.json({ success: true, data: { membership: membership!.toJSON() } });
 });
