@@ -49,6 +49,10 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onBack, onFinish }) => {
   const [requirements, setRequirements] = useState<AIAnalysisResult['requirements']>([]);
   const [resources, setResources] = useState<AIAnalysisResult['resources']>([]);
   const [teamSize, setTeamSize] = useState(3);
+  // Bounds the AI detected from the event's own rules (e.g. "teams of 2-4").
+  // Defaults are permissive until an analysis result narrows them.
+  const [teamSizeMin, setTeamSizeMin] = useState(1);
+  const [teamSizeMax, setTeamSizeMax] = useState(10);
 
   const resetScanSteps = () => {
     setScanSteps(prev => prev.map(step => ({ ...step, status: 'pending', result: undefined })));
@@ -91,7 +95,13 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onBack, onFinish }) => {
       setDeadlines(result.deadlines);
       setRequirements(result.requirements);
       setResources(result.resources);
-      setTeamSize(result.event.teamSize);
+      // Clamp to the range the event itself specifies (e.g. "teams of 2-4")
+      // so the slider can never be dragged to a size the event doesn't allow.
+      const min = result.event.teamSizeMin ?? 1;
+      const max = Math.max(min, result.event.teamSizeMax ?? result.event.teamSize ?? min);
+      setTeamSizeMin(min);
+      setTeamSizeMax(max);
+      setTeamSize(Math.min(Math.max(result.event.teamSize, min), max));
       setMode('confirm');
     } catch (err) {
       setScanSteps(prev => prev.map((step, idx) => idx === 0
@@ -171,7 +181,11 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onBack, onFinish }) => {
       setDeadlines(result.deadlines);
       setRequirements(result.requirements);
       setResources(result.resources);
-      setTeamSize(result.event.teamSize);
+      // Manual entries have no detected rules to enforce, so keep the
+      // confirm-screen slider generously wide around the chosen size.
+      setTeamSizeMin(1);
+      setTeamSizeMax(Math.max(10, manualTeamSize));
+      setTeamSize(manualTeamSize);
       setMode('confirm');
     }, 500);
   };
@@ -647,15 +661,23 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onBack, onFinish }) => {
               {/* Team Settings */}
               <div>
                 <label style={labelFormStyle}>Expected Team size</label>
+                {parsedData.event.participationDetails && (
+                  <p style={{ fontSize: '0.72rem', color: 'var(--text-tertiary)', margin: '0.15rem 0 0.5rem' }}>
+                    Detected from source: {parsedData.event.participationDetails}
+                  </p>
+                )}
                 <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+                  <span style={{ fontSize: '0.72rem', color: 'var(--text-tertiary)', minWidth: '14px' }}>{teamSizeMin}</span>
                   <input
                     type="range"
-                    min="1"
-                    max="6"
+                    min={teamSizeMin}
+                    max={teamSizeMax}
                     value={teamSize}
                     onChange={e => setTeamSize(parseInt(e.target.value))}
+                    disabled={teamSizeMin === teamSizeMax}
                     style={{ flex: 1, accentColor: 'var(--primary)' }}
                   />
+                  <span style={{ fontSize: '0.72rem', color: 'var(--text-tertiary)', minWidth: '14px' }}>{teamSizeMax}</span>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minWidth: '80px', justifyContent: 'flex-end' }}>
                     <User size={14} style={{ color: 'var(--text-secondary)' }} />
                     <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>{teamSize} members</span>

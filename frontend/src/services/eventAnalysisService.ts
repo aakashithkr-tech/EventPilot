@@ -4,7 +4,14 @@ import { Event, Deadline, Requirement, Resource, TeamMember } from '../types';
 export interface AIAnalysisResult {
   sourceUrl?: string;
   sourceType: 'url' | 'text';
-  event: Omit<Event, 'id'>;
+  event: Omit<Event, 'id'> & {
+    /** Smallest team size allowed by the event's own rules (e.g. "2-4 members" → 2). */
+    teamSizeMin?: number;
+    /** Largest team size allowed by the event's own rules (e.g. "2-4 members" → 4). */
+    teamSizeMax?: number;
+    individualAllowed?: boolean;
+    participationDetails?: string;
+  };
   deadlines: Omit<Deadline, 'id' | 'eventId'>[];
   requirements: Omit<Requirement, 'id' | 'eventId'>[];
   resources: Omit<Resource, 'id' | 'eventId'>[];
