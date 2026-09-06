@@ -199,7 +199,9 @@ function parseDateCandidate(raw: string, fallbackYear?: number): Date | null {
 }
 
 function dateRegex(): RegExp {
-  return /\b(?:\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}[\/-]\d{1,2}[\/-]\d{4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?=\s|$|,)|\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)(?=\s|$|,))\b/gi;
+  // Keep this regex non-global so every test/match starts from a clean state.
+  // Event platforms commonly render dates with or without the year.
+  return /\b(?:\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}[\/-]\d{1,2}[\/-]\d{4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?=\s|$|,)|\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)(?=\s|$|,))\b/i;
 }
 
 function normalizeDate(date: Date): string {
@@ -255,86 +257,74 @@ function extractDeadlineTitle(label: string): string {
 }
 
 function extractDeadlines(text: string): AnalyzedDeadline[] {
-  const lines = text.split('\n').map(cleanText).filter(Boolean);
+  const lines = text.split(/\r?\n/).map(cleanText).filter(Boolean);
   const sourceYear = inferSourceYear(text);
   const candidates: Array<AnalyzedDeadline & { key: string; priority: number; order: number }> = [];
   const keyword = /registration|application|submission|deadline|closing|close|proposal|abstract|presentation|speaker|final|last date|due|event start|event end/i;
 
-  // Event pages often render labels and dates as separate DOM lines. Pair a
-  // label only with the nearest date line, rather than mixing unrelated times
-  // from neighbouring timeline entries.
+  const addCandidate = (labelSource: string, rawDate: string, order: number) => {
+    const date = parseDateCandidate(rawDate, sourceYear);
+    if (!date || Number.isNaN(date.getTime())) return;
+
+    const title = extractDeadlineTitle(labelSource.replace(rawDate, '').trim());
+    const key = deadlineKey(title);
+    candidates.push({
+      title,
+      date: normalizeDate(date),
+      type: 'official',
+      verified: true,
+      key,
+      priority: deadlinePriority(title),
+      order,
+    });
+  };
+
+  // First handle labels and dates rendered on separate DOM lines. We allow a
+  // few intermediate UI lines, but never cross another semantic milestone.
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!keyword.test(line)) continue;
 
     const sameLineDates = line.match(dateRegex()) || [];
-    const dateEntries: Array<{ raw: string; offset: number }> = sameLineDates.map((raw) => ({ raw, offset: 0 }));
-
-    if (dateEntries.length === 0) {
-  for (let offset = 1; offset <= 4; offset++) {
-    const next = lines[i + offset];
-    if (!next) break;
-
-    const match = next.match(dateRegex());
-
-    if (match?.length) {
-      dateEntries.push({ raw: match[0], offset });
-      break;
-    }
-
-    // Ignore time-only lines, but keep looking for the actual calendar date.
-    if (/\b\d{1,2}:\d{2}\s*(?:AM|PM)\b/i.test(next)) {
+    if (sameLineDates.length) {
+      for (const raw of sameLineDates) addCandidate(line, raw, i);
       continue;
     }
 
-    // Stop if another semantic timeline label appears before a date.
-    if (offset > 1 && keyword.test(next)) {
-      break;
-    }
-  }
-}
+    for (let offset = 1; offset <= 6; offset++) {
+      const next = lines[i + offset];
+      if (!next) break;
 
-    for (const entry of dateEntries) {
-      const date = parseDateCandidate(entry.raw, sourceYear);
-      if (!date || Number.isNaN(date.getTime())) continue;
-      const labelSource = line.replace(entry.raw, '').trim();
-      const title = extractDeadlineTitle(labelSource);
-      const key = deadlineKey(title);
-      candidates.push({
-        title,
-        date: normalizeDate(date),
-        type: 'official',
-        verified: true,
-        key,
-        priority: deadlinePriority(title),
-        order: i,
-      });
+      const match = next.match(dateRegex());
+      if (match?.length) {
+        addCandidate(line, match[0], i);
+        break;
+      }
+
+      // Ignore time-only rows such as "11:59 PM" and continue searching.
+      if (/^\s*\d{1,2}:\d{2}\s*(?:AM|PM)\s*$/i.test(next)) continue;
+
+      // Another milestone means the previous label no longer owns later dates.
+      if (offset > 1 && keyword.test(next)) break;
     }
   }
 
-  // Some rendered pages flatten "Registration closes on Sep 15, 2026" into
-  // one sentence. Catch those only when a complete date is present.
+  // Catch flattened sentences such as "Registration closes on Sep 15, 2026".
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!keyword.test(line)) continue;
     for (const rawDate of line.match(dateRegex()) || []) {
-      const date = parseDateCandidate(rawDate, sourceYear);
-      if (!date || Number.isNaN(date.getTime())) continue;
-      const labelSource = line.replace(rawDate, '').trim();
-      const title = extractDeadlineTitle(labelSource);
-      const key = deadlineKey(title);
-      candidates.push({ title, date: normalizeDate(date), type: 'official', verified: true, key, priority: deadlinePriority(title), order: i });
+      addCandidate(line, rawDate, i);
     }
   }
 
-  // One canonical deadline per logical milestone. If the page repeats the same
-  // milestone, prefer the latest date; for an exact tie prefer the stronger
-  // semantic match. This is the important part for pages with repeated
-  // "Registration closes on ..." cards/banners.
+  // One canonical deadline per logical milestone. Repeated banners/cards are
+  // common on event sites, so keep the latest date and strongest label.
   const best = new Map<string, typeof candidates[number]>();
   for (const candidate of candidates) {
     const existing = best.get(candidate.key);
-    if (!existing || candidate.date > existing.date || (candidate.date === existing.date && candidate.priority > existing.priority)) {
+    if (!existing || candidate.date > existing.date ||
+        (candidate.date === existing.date && candidate.priority > existing.priority)) {
       best.set(candidate.key, candidate);
     }
   }
@@ -487,9 +477,13 @@ async function fetchUrl(url: string): Promise<{ html: string; finalUrl: string }
 }
 
 async function renderUrl(url: string): Promise<{ html: string; text: string; finalUrl: string }> {
-  process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
   let browser: any;
   try {
+    // The browser is installed locally inside the deployed Playwright package.
+    // Set this before requiring Playwright so its executable lookup uses the
+    // same location that the postinstall script populated.
+    process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
+
     // Playwright is intentionally loaded lazily so text-only analysis and
     // normal HTML pages do not pay the browser startup cost.
     const playwright = require('playwright');
@@ -535,28 +529,32 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
   const urlSource = /^https?:\/\//i.test(source) ? source : `https://${source}`;
 
   if (isUrl) {
-  try {
-    const fetched = await fetchUrl(urlSource);
-    html = fetched.html;
-    finalUrl = fetched.finalUrl;
+    try {
+      const fetched = await fetchUrl(urlSource);
+      html = fetched.html;
+      finalUrl = fetched.finalUrl;
 
-    if (extractDeadlines(stripHtml(html)).length === 0) {
-      const rendered = await renderUrl(finalUrl);
+      // Many modern event platforms populate the timeline through client-side JS.
+      if (extractDeadlines(stripHtml(html)).length === 0) {
+        const rendered = await renderUrl(finalUrl);
+        html = rendered.html;
+        renderedText = rendered.text;
+        finalUrl = rendered.finalUrl;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.log(`[event-analysis] Direct fetch failed, trying browser render: ${message}`);
+
+      const rendered = await renderUrl(urlSource);
       html = rendered.html;
       renderedText = rendered.text;
       finalUrl = rendered.finalUrl;
     }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-
-    console.log(`[event-analysis] Direct fetch failed, trying browser render: ${message}`);
-
-    const rendered = await renderUrl(urlSource);
-    html = rendered.html;
-    renderedText = rendered.text;
-    finalUrl = rendered.finalUrl;
+  } else {
+    // Text mode is intentionally limited to user-provided content; it never invents missing fields.
+    html = `<main>${source.replace(/\n/g, '<br>')}</main>`;
   }
-}
+
   const visibleText = renderedText?.trim() || stripHtml(html);
   const firstTextLine = visibleText.split('\n').map(cleanText).find(Boolean) || 'Untitled Event';
   const title = isUrl ? extractTitle(html, finalUrl) : firstTextLine.slice(0, 200);
