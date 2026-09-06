@@ -79,7 +79,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onBack, onFinish }) => {
         `✓ ${result.deadlines.length} deadline${result.deadlines.length === 1 ? '' : 's'} found`,
         `✓ ${result.requirements.length} requirement${result.requirements.length === 1 ? '' : 's'} found`,
         `✓ ${result.resources.length} resource${result.resources.length === 1 ? '' : 's'} found`,
-        `✓ Team size ${result.event.teamSize} detected`,
+        `✓ ${result.event.teamSizeMin === result.event.teamSizeMax ? `Team size ${result.event.teamSizeMin}` : `Team size ${result.event.teamSizeMin}–${result.event.teamSizeMax}`} detected`,
         `✓ ${result.confidence.overall} confidence · plan inputs ready`,
       ];
 
@@ -664,7 +664,9 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onBack, onFinish }) => {
                 {parsedData.event.participationDetails && (
                   <p style={{ fontSize: '0.72rem', color: 'var(--text-tertiary)', margin: '0.15rem 0 0.5rem' }}>
                     Detected from source: {parsedData.event.participationDetails}
-                    {' '}(allowed: {teamSizeMin === teamSizeMax ? `${teamSizeMin} only` : `${teamSizeMin}–${teamSizeMax}`})
+                    {teamSizeMin === 1 && teamSizeMax === 1 && !parsedData.event.individualAllowed
+                      ? ''
+                      : ` (allowed: ${teamSizeMin === teamSizeMax ? `${teamSizeMin} only` : `${teamSizeMin}–${teamSizeMax}`})`}
                   </p>
                 )}
                 <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>

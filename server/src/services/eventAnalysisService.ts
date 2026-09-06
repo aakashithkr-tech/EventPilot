@@ -58,6 +58,55 @@ export interface EventAnalysisResult {
 
 const MAX_SOURCE_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 15_000;
+const GEMINI_TIMEOUT_MS = 45_000;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.7-flash';
+
+const EVENT_TYPE_VALUES = ['hackathon', 'competition', 'conference', 'workshop'] as const;
+
+type GeminiDeadline = {
+  title?: unknown;
+  date?: unknown;
+  verified?: unknown;
+};
+
+type GeminiResource = {
+  name?: unknown;
+  type?: unknown;
+  fileType?: unknown;
+  url?: unknown;
+};
+
+type GeminiExtraction = {
+  event?: {
+    name?: unknown;
+    type?: unknown;
+    description?: unknown;
+    organizer?: unknown;
+    location?: unknown;
+    participation?: {
+      minMembers?: unknown;
+      maxMembers?: unknown;
+      individualAllowed?: unknown;
+      details?: unknown;
+    };
+  };
+  deadlines?: GeminiDeadline[];
+  primaryDeadline?: {
+    date?: unknown;
+    title?: unknown;
+  } | null;
+  requirements?: Array<unknown>;
+  resources?: GeminiResource[];
+  confidence?: unknown;
+  notes?: Array<unknown>;
+};
+
+function cleanText(value: string): string {
+  return value
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 function decodeHtml(value: string): string {
   return value
@@ -78,7 +127,10 @@ function stripHtml(html: string): string {
       .replace(/<noscript[\s\S]*?<\/noscript>/gi, '\n')
       .replace(/<svg[\s\S]*?<\/svg>/gi, '\n')
       .replace(/<br\s*\/?\s*>/gi, '\n')
-      .replace(/<\/(p|div|section|article|li|h[1-6]|tr|td|th|header|footer|main|aside)>/gi, '\n')
+      .replace(
+        /<\/(p|div|section|article|li|h[1-6]|tr|td|th|header|footer|main|aside|nav)>/gi,
+        '\n'
+      )
       .replace(/<[^>]+>/g, ' ')
       .replace(/[ \t]+/g, ' ')
       .replace(/\n\s*\n+/g, '\n')
@@ -89,54 +141,56 @@ function stripHtml(html: string): string {
   );
 }
 
-function cleanText(value: string): string {
-  return decodeHtml(value).replace(/\s+/g, ' ').trim();
-}
-
-// Some sites render small UI pieces (badges/pills, an icon next to a label)
-// as adjacent inline nodes with no whitespace between them, so the browser's
-// visible text comes out as "TeamSize2-4Members" instead of "Team Size 2-4
-// Members". Every keyword/date regex below relies on real word boundaries,
-// so a single squashed run can silently hide an otherwise-perfect match.
-// Insert a space at the obvious boundaries (lower→upper case, letter→digit,
-// digit→letter) as a cheap safety net before running extraction.
-function repairSquashedWhitespace(value: string): string {
-  return value
-    .replace(/([a-z])([A-Z])/g, '$1 $2')
-    .replace(/([A-Za-z])(\d)/g, '$1 $2')
-    .replace(/(\d)([A-Za-z])/g, '$1 $2');
-}
-
 function extractMeta(html: string, key: string): string | undefined {
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const patterns = [
-    new RegExp(`<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, 'i'),
-    new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+(?:property|name)=["']${escaped}["'][^>]*>`, 'i'),
+    new RegExp(
+      `<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`,
+      'i'
+    ),
+    new RegExp(
+      `<meta[^>]+content=["']([^"']*)["'][^>]+(?:property|name)=["']${escaped}["'][^>]*>`,
+      'i'
+    ),
   ];
+
   for (const pattern of patterns) {
     const match = html.match(pattern);
     if (match?.[1]) return cleanText(match[1]);
   }
+
   return undefined;
 }
 
-function extractTitle(html: string, sourceUrl?: string): string {
-  const ogTitle = extractMeta(html, 'og:title');
-  if (ogTitle) return trimSiteSuffix(ogTitle);
-  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1];
-  if (title) return trimSiteSuffix(cleanText(title));
-  if (sourceUrl) {
-    const host = new URL(sourceUrl).hostname.replace(/^www\./, '');
-    return host.split('.')[0].replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-  }
-  return 'Untitled Event';
+function trimSiteSuffix(title: string): string {
+  return cleanText(title)
+    .replace(
+      /\s*[|•–—-]\s*(unstop|devpost|eventbrite|meetup|hack2skill|linkedin)\s*$/i,
+      ''
+    )
+    .slice(0, 200);
 }
 
-function trimSiteSuffix(title: string): string {
-  return title
-    .replace(/\s*[|•–—-]\s*(unstop|devpost|eventbrite|meetup|hack2skill|linkedin).*$/i, '')
-    .trim()
-    .slice(0, 200);
+function fallbackTitle(html: string, sourceUrl?: string): string {
+  const ogTitle = extractMeta(html, 'og:title');
+  if (ogTitle) return trimSiteSuffix(ogTitle);
+
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1];
+  if (title) return trimSiteSuffix(title);
+
+  if (sourceUrl) {
+    try {
+      const host = new URL(sourceUrl).hostname.replace(/^www\./i, '');
+      return host
+        .split('.')[0]
+        .replace(/[-_]+/g, ' ')
+        .replace(/\b\w/g, (c) => c.toUpperCase());
+    } catch {
+      // Ignore malformed URL fallback.
+    }
+  }
+
+  return 'Untitled Event';
 }
 
 function inferType(text: string): EventAnalysisResult['event']['type'] {
@@ -147,539 +201,553 @@ function inferType(text: string): EventAnalysisResult['event']['type'] {
   return 'hackathon';
 }
 
-function inferParticipation(text: string): {
+function normalizeDateValue(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+
+  const text = value.trim();
+  if (!text) return null;
+
+  const isoMatch = text.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+  if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+
+  const parsed = new Date(text);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString().slice(0, 10);
+  }
+
+  const monthMap: Record<string, number> = {
+    jan: 1, january: 1,
+    feb: 2, february: 2,
+    mar: 3, march: 3,
+    apr: 4, april: 4,
+    may: 5,
+    jun: 6, june: 6,
+    jul: 7, july: 7,
+    aug: 8, august: 8,
+    sep: 9, sept: 9, september: 9,
+    oct: 10, october: 10,
+    nov: 11, november: 11,
+    dec: 12, december: 12,
+  };
+
+  const shortYear = text.match(/\b(\d{1,2})\s+([A-Za-z]+)\s*['’]\s*(\d{2})\b/);
+  if (shortYear) {
+    const day = Number(shortYear[1]);
+    const month = monthMap[shortYear[2].toLowerCase()];
+    const year = 2000 + Number(shortYear[3]);
+    if (month && day >= 1 && day <= 31) {
+      return `${year.toString().padStart(4, '0')}-${month.toString().padStart(2, '0')}-${day
+        .toString()
+        .padStart(2, '0')}`;
+    }
+  }
+
+  const shortYearReverse = text.match(/\b([A-Za-z]+)\s+(\d{1,2})\s*['’]\s*(\d{2})\b/);
+  if (shortYearReverse) {
+    const month = monthMap[shortYearReverse[1].toLowerCase()];
+    const day = Number(shortYearReverse[2]);
+    const year = 2000 + Number(shortYearReverse[3]);
+    if (month && day >= 1 && day <= 31) {
+      return `${year.toString().padStart(4, '0')}-${month.toString().padStart(2, '0')}-${day
+        .toString()
+        .padStart(2, '0')}`;
+    }
+  }
+
+  return null;
+}
+
+function normalizeTeamSize(
+  minRaw: unknown,
+  maxRaw: unknown,
+  individualAllowedRaw: unknown
+): {
   teamSize: number;
-  teamSizeMin: number;
-  teamSizeMax: number;
+  min: number;
+  max: number;
   individualAllowed: boolean;
-  participationDetails: string;
+  known: boolean;
 } {
-  const value = cleanText(text);
+  const minNumber = Number(minRaw);
+  const maxNumber = Number(maxRaw);
 
-  // Explicit solo/individual participation.
-  const individualAllowed =
-    /\b(?:individual|solo|single[-\s]?participant|participate\s+(?:alone|individually))\b/i.test(value) &&
-    !/\b(?:not\s+allowed|not\s+permitted|only\s+teams?|teams?\s+only)\b/i.test(value);
+  const hasMin = Number.isFinite(minNumber) && minNumber > 0;
+  const hasMax = Number.isFinite(maxNumber) && maxNumber > 0;
+  const individualAllowed = individualAllowedRaw === true;
 
-  // Prefer explicit ranges such as "1-4 members", "2 to 4 members",
-  // "teams of 2–4", or "team size: 2-4".
-  const rangePatterns = [
-    /\bteam(?:\s+size|\s+of)?\s*[:=-]?\s*(\d+)\s*(?:-|–|—|to)\s*(\d+)\s*(?:members?|participants?|people)?\b/i,
-    /\bteams?\s+of\s+(\d+)\s*(?:-|–|—|to)\s*(\d+)\s*(?:members?|participants?|people)?\b/i,
-    /\b(\d+)\s*(?:-|–|—|to)\s*(\d+)\s*(?:members?|participants?)\b/i,
-  ];
-
-  for (const pattern of rangePatterns) {
-    const match = value.match(pattern);
-    if (!match) continue;
-
-    const a = Number(match[1]);
-    const b = Number(match[2]);
-    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
-
-    const min = Math.min(a, b);
-    const max = Math.max(a, b);
+  if (hasMin || hasMax) {
+    const min = hasMin ? Math.round(minNumber) : individualAllowed ? 1 : 2;
+    const max = hasMax ? Math.max(min, Math.round(maxNumber)) : min;
 
     return {
-      teamSize: max,
-      teamSizeMin: min,
-      teamSizeMax: max,
+      teamSize: Math.min(Math.max(min, 1), max),
+      min,
+      max,
       individualAllowed,
-      participationDetails: individualAllowed
-        ? `Individual or teams of ${min}–${max} members`
-        : `Teams of ${min}–${max} members`,
+      known: true,
     };
-  }
-
-  // "Up to N members" means 1..N unless individual participation is
-  // explicitly disallowed.
-  const upTo = value.match(
-    /\b(?:maximum|max\.?|up\s+to|at\s+most)\s*(\d+)\s*(?:members?|participants?|people)\b/i
-  );
-  if (upTo) {
-    const max = Number(upTo[1]);
-    if (Number.isFinite(max)) {
-      const min = individualAllowed ? 1 : 2;
-      return {
-        teamSize: max,
-        teamSizeMin: min,
-        teamSizeMax: max,
-        individualAllowed,
-        participationDetails: individualAllowed
-          ? `Individual or teams of up to ${max} members`
-          : `Teams of up to ${max} members`,
-      };
-    }
-  }
-
-  // Fixed "team size: 4", "4 members per team", etc.
-  const fixed = value.match(
-    /\b(?:team\s+size|teams?\s+of|team\s+of)\s*[:=-]?\s*(\d+)\s*(?:members?|participants?|people)\b/i
-  ) || value.match(/\b(\d+)\s*(?:members?|participants?|people)\s+per\s+team\b/i);
-
-  if (fixed) {
-    const size = Number(fixed[1]);
-    if (Number.isFinite(size)) {
-      return {
-        teamSize: size,
-        teamSizeMin: size,
-        teamSizeMax: size,
-        individualAllowed,
-        participationDetails: individualAllowed
-          ? `Individual or teams of ${size} members`
-          : `${size} members per team`,
-      };
-    }
   }
 
   if (individualAllowed) {
     return {
       teamSize: 1,
-      teamSizeMin: 1,
-      teamSizeMax: 1,
+      min: 1,
+      max: 1,
       individualAllowed: true,
-      participationDetails: 'Individual participation allowed',
+      known: true,
     };
   }
 
   return {
+    // Preserve the existing backend contract while explicitly marking the
+    // value as unknown in participationDetails/warnings.
     teamSize: 1,
-    teamSizeMin: 1,
-    teamSizeMax: 1,
+    min: 1,
+    max: 1,
     individualAllowed: false,
-    participationDetails: 'Team size not explicitly detected',
+    known: false,
   };
 }
 
-function inferTeamSize(text: string): number {
-  return inferParticipation(text).teamSize;
+function cleanRequirements(values: unknown, sourceUrl?: string): AnalyzedRequirement[] {
+  if (!Array.isArray(values)) return [];
+
+  const seen = new Set<string>();
+  const result: AnalyzedRequirement[] = [];
+
+  for (const raw of values) {
+    const text = cleanText(String(raw ?? ''));
+    if (!text || text.length < 3 || text.length > 240) continue;
+
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    result.push({
+      title: text,
+      completed: false,
+      requiredBy: 'Event Requirements',
+      ...(sourceUrl ? { sourceLink: sourceUrl } : {}),
+      verified: true,
+    });
+
+    if (result.length >= 50) break;
+  }
+
+  return result;
 }
 
-function inferSourceYear(text: string): number {
-  const years = [...text.matchAll(/\b(20\d{2})\b/g)].map((match) => Number(match[1]));
-  if (years.length > 0) {
-    const counts = new Map<number, number>();
-    for (const year of years) counts.set(year, (counts.get(year) || 0) + 1);
-    return [...counts.entries()].sort((a, b) => b[1] - a[1] || b[0] - a[0])[0][0];
+function cleanResources(values: unknown, sourceUrl?: string): AnalyzedResource[] {
+  if (!Array.isArray(values)) return [];
+
+  const seen = new Set<string>();
+  const result: AnalyzedResource[] = [];
+
+  for (const raw of values) {
+    if (!raw || typeof raw !== 'object') continue;
+
+    const item = raw as GeminiResource;
+    const name = cleanText(String(item.name ?? ''));
+    const rawUrl = cleanText(String(item.url ?? ''));
+    if (!name || !rawUrl) continue;
+
+    let absoluteUrl = rawUrl;
+    try {
+      absoluteUrl = new URL(rawUrl, sourceUrl || undefined).toString();
+    } catch {
+      continue;
+    }
+
+    const key = absoluteUrl.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const rawType = String(item.type ?? '').toLowerCase();
+    const type: AnalyzedResource['type'] = rawType === 'template'
+      ? 'template'
+      : rawType === 'document'
+        ? 'document'
+        : 'link';
+
+    const fileType = cleanText(String(item.fileType ?? '')) || (/\.pdf(?:$|[?#])/i.test(absoluteUrl) ? 'PDF' : 'URL');
+
+    result.push({
+      name: name.slice(0, 180),
+      type,
+      fileType,
+      source: 'Extracted from event source',
+      url: absoluteUrl,
+    });
+
+    if (result.length >= 30) break;
   }
-  return new Date().getUTCFullYear();
+
+  return result;
 }
 
-function parseDateCandidate(raw: string, fallbackYear?: number): Date | null {
-  const value = raw.trim().replace(/\b(st|nd|rd|th)\b/gi, '').replace(/,/g, '');
-  const monthNames: Record<string, number> = {
-    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
-    may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7,
-    sep: 8, sept: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10,
-    dec: 11, december: 11,
-  };
-  const year = fallbackYear ?? new Date().getUTCFullYear();
+function cleanDeadlines(values: unknown): AnalyzedDeadline[] {
+  if (!Array.isArray(values)) return [];
 
-  let match = value.match(/\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b/);
-  if (match && monthNames[match[2].toLowerCase()] !== undefined) {
-    return new Date(Date.UTC(Number(match[3]), monthNames[match[2].toLowerCase()], Number(match[1])));
-  }
-  match = value.match(/\b([A-Za-z]+)\s+(\d{1,2})\s+(\d{4})\b/);
-  if (match && monthNames[match[1].toLowerCase()] !== undefined) {
-    return new Date(Date.UTC(Number(match[3]), monthNames[match[1].toLowerCase()], Number(match[2])));
-  }
-  match = value.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
-  if (match) return new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
-  match = value.match(/\b(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})\b/);
-  if (match) {
-    const first = Number(match[1]);
-    const second = Number(match[2]);
-    const day = first > 12 ? first : second;
-    const month = first > 12 ? second : first;
-    return new Date(Date.UTC(Number(match[3]), month - 1, day));
+  const seen = new Map<string, AnalyzedDeadline>();
+
+  for (const raw of values) {
+    if (!raw || typeof raw !== 'object') continue;
+
+    const item = raw as GeminiDeadline;
+    const title = cleanText(String(item.title ?? ''));
+    const date = normalizeDateValue(item.date);
+
+    if (!title || !date) continue;
+
+    const key = title
+      .toLowerCase()
+      .replace(/registration.*close|application.*close/, 'registration-close')
+      .replace(/code freeze.*submission|final submission|submission deadline/, 'final-submission')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    seen.set(key || title.toLowerCase(), {
+      title: title.slice(0, 120),
+      date,
+      type: 'official',
+      verified: item.verified !== false,
+    });
   }
 
-  // Many event platforms render timeline dates without the year,
-  // e.g. "Aug 16, 04:38 PM". Use the page's repeated year when available.
-  match = value.match(/\b([A-Za-z]+)\s+(\d{1,2})\b/);
-  if (match && monthNames[match[1].toLowerCase()] !== undefined) {
-    return new Date(Date.UTC(year, monthNames[match[1].toLowerCase()], Number(match[2])));
+  return [...seen.values()]
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(0, 50);
+}
+
+function choosePrimaryDeadline(
+  deadlines: AnalyzedDeadline[],
+  primary?: GeminiExtraction['primaryDeadline']
+): string {
+  const explicit = normalizeDateValue(primary?.date);
+  if (explicit) return explicit;
+
+  const scored = deadlines.map((deadline) => {
+    const title = deadline.title.toLowerCase();
+    let score = 0;
+
+    if (/final submission|submission deadline|code freeze|project due/.test(title)) score += 100;
+    else if (/submission|deliverable|project deadline/.test(title)) score += 90;
+    else if (/registration|application/.test(title) && /deadline|close|closing|last date/.test(title)) score += 60;
+    else if (/event end|ends|hackathon ends/.test(title)) score += 30;
+    else if (/judging|winner|write.?up/.test(title)) score -= 100;
+
+    return { deadline, score };
+  });
+
+  const useful = scored
+    .filter(({ deadline }) => !/winner|judging/.test(deadline.title.toLowerCase()))
+    .sort((a, b) => b.score - a.score || b.deadline.date.localeCompare(a.deadline.date));
+
+  return useful[0]?.deadline.date || '';
+}
+
+function confidenceFrom(value: unknown, fallback: EventAnalysisResult['confidence']['overall']): EventAnalysisResult['confidence']['overall'] {
+  if (value === 'high' || value === 'medium' || value === 'low') return value;
+  return fallback;
+}
+
+function extractJsonFromText(value: string): unknown | null {
+  const trimmed = value.trim();
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Continue with fenced/embedded JSON recovery.
   }
-  match = value.match(/\b(\d{1,2})\s+([A-Za-z]+)\b/);
-  if (match && monthNames[match[2].toLowerCase()] !== undefined) {
-    return new Date(Date.UTC(year, monthNames[match[2].toLowerCase()], Number(match[1])));
+
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)?.[1];
+  if (fenced) {
+    try {
+      return JSON.parse(fenced.trim());
+    } catch {
+      // Continue.
+    }
   }
+
+  const objectStart = trimmed.indexOf('{');
+  const objectEnd = trimmed.lastIndexOf('}');
+
+  if (objectStart >= 0 && objectEnd > objectStart) {
+    try {
+      return JSON.parse(trimmed.slice(objectStart, objectEnd + 1));
+    } catch {
+      // Continue.
+    }
+  }
+
   return null;
 }
 
-function dateRegex(): RegExp {
-  // Keep this regex non-global so every test/match starts from a clean state.
-  // Event platforms commonly render dates with or without the year.
-  return /\b(?:\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}[\/-]\d{1,2}[\/-]\d{4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?=\s|$|,)|\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)(?=\s|$|,))\b/i;
-}
+function getInteractionOutputText(data: any): string {
+  if (typeof data?.output_text === 'string') return data.output_text;
+  if (typeof data?.text === 'string') return data.text;
 
-function normalizeDate(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
+  const outputs = Array.isArray(data?.output) ? data.output : [];
+  const chunks: string[] = [];
 
-function deadlineKey(title: string): string {
-  const value = cleanText(title).toLowerCase();
-  if (/registration/.test(value) && /open|start|begin/.test(value)) return 'registration-open';
-  if (/registration|application/.test(value) && /close|closing|deadline|last date|due/.test(value)) return 'registration-close';
-  if (/submission/.test(value) && /final|close|closing|deadline|last date|due/.test(value)) return 'final-submission';
-  if (/proposal/.test(value)) return 'proposal';
-  if (/abstract/.test(value)) return 'abstract';
-  if (/presentation/.test(value)) return 'presentation';
-  if (/speaker/.test(value)) return 'speaker';
-  if (/event.*start|start.*event/.test(value)) return 'event-start';
-  if (/event.*end|end.*event/.test(value)) return 'event-end';
-  return normalizeDeadlineLabel(value);
-}
-
-function normalizeDeadlineLabel(value: string): string {
-  return value
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\b(the|official|date|time|on|at)\b/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function deadlinePriority(title: string): number {
-  const key = deadlineKey(title);
-  if (key === 'registration-close') return 100;
-  if (key === 'final-submission') return 95;
-  if (key === 'registration-open') return 90;
-  if (key === 'submission') return 85;
-  if (key === 'proposal' || key === 'abstract' || key === 'presentation' || key === 'speaker') return 80;
-  if (key === 'event-start' || key === 'event-end') return 60;
-  return 50;
-}
-
-function extractDeadlineTitle(label: string): string {
-  const lower = label.toLowerCase();
-  if (/registration/.test(lower) && /open|start|begin/.test(lower)) return 'Registration Opens';
-  if (/registration|application/.test(lower) && /close|closing|deadline|last date|due/.test(lower)) return 'Registration Closes';
-  if (/event/.test(lower) && /start/.test(lower)) return 'Event Starts';
-  if (/event/.test(lower) && /end/.test(lower)) return 'Event Ends';
-  if (/final\s+submission|final/.test(lower) && /submission|deadline|due|close|closing/.test(lower)) return 'Final Submission Deadline';
-  if (/abstract/.test(lower)) return 'Abstract Submission';
-  if (/proposal/.test(lower)) return 'Proposal Submission';
-  if (/presentation/.test(lower)) return 'Presentation Submission';
-  if (/speaker/.test(lower)) return 'Speaker Deadline';
-  if (/submission|deadline|closing|close|last date|due/.test(lower)) return 'Submission Deadline';
-  return label.replace(/\s+/g, ' ').trim().slice(0, 90) || 'Official Event Deadline';
-}
-
-function extractDeadlines(text: string): AnalyzedDeadline[] {
-  const normalizedText = decodeHtml(text).replace(/\u00a0/g, ' ');
-  const lines = normalizedText.split(/\r?\n/).map(cleanText).filter(Boolean);
-  const sourceYear = inferSourceYear(normalizedText);
-  const candidates: Array<AnalyzedDeadline & { key: string; priority: number; order: number }> = [];
-
-  // Event pages use many different labels. Keep the label broad here and
-  // normalize it later with extractDeadlineTitle/deadlineKey.
-  const keyword = /registration|application|submission|deadline|closing|close|proposal|abstract|presentation|speaker|final|last date|due|event start|event end|judging|team formation|specification|code freeze|write up|winners?/i;
-
-  const addCandidate = (labelSource: string, rawDate: string, order: number) => {
-    const date = parseDateCandidate(rawDate, sourceYear);
-    if (!date || Number.isNaN(date.getTime())) return;
-
-    const cleanedLabel = cleanText(labelSource)
-      .replace(rawDate, ' ')
-      .replace(/\b(?:at|on|by|until)\s*$/i, '')
-      .trim();
-
-    const title = extractDeadlineTitle(cleanedLabel);
-    const key = deadlineKey(title);
-
-    candidates.push({
-      title,
-      date: normalizeDate(date),
-      type: 'official',
-      verified: true,
-      key,
-      priority: deadlinePriority(title),
-      order,
-    });
-  };
-
-  const hasDate = (value: string) => (value.match(dateRegex()) || []).length > 0;
-  const isTimeOnly = (value: string) => /^\d{1,2}:\d{2}\s*(?:AM|PM)(?:\s*[A-Z]{2,5})?$/i.test(value);
-
-  // 1) Normal DOM structure.
-  // Pair a milestone only with a real date. Never use a time-only line.
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!keyword.test(line)) continue;
-
-    const sameLineDates = line.match(dateRegex()) || [];
-    if (sameLineDates.length) {
-      for (const raw of sameLineDates) addCandidate(line, raw, i);
-      continue;
-    }
-
-    for (let offset = 1; offset <= 8; offset++) {
-      const next = lines[i + offset];
-      if (!next) break;
-
-      if (isTimeOnly(next)) continue;
-
-      const match = next.match(dateRegex());
-      if (match?.[0]) {
-        addCandidate(line, match[0], i);
-        break;
+  for (const item of outputs) {
+    if (typeof item?.text === 'string') chunks.push(item.text);
+    if (Array.isArray(item?.content)) {
+      for (const content of item.content) {
+        if (typeof content?.text === 'string') chunks.push(content.text);
       }
-
-      // Once another labelled milestone begins, this milestone has no date
-      // in its own block. Do not steal the next milestone's date.
-      if (offset > 1 && keyword.test(next)) break;
     }
   }
 
-  // 2) Flattened SPA/React text.
-  // Some event pages collapse the timeline into a single line. Treat each
-  // known milestone as a boundary and search only inside that milestone's
-  // local window.
-  const flat = cleanText(normalizedText);
-  const milestoneRegex =
-    /(registration\s+(?:opens?|open|starts?|begins?|closes?|closing|deadline)|application\s+(?:deadline|closes?|closing)|hackathon\s+(?:begins?|starts?|ends?)|event\s+(?:starts?|ends?)|final\s+submission(?:\s+deadline)?|code\s+freeze(?:\s+and\s+submission\s+deadline)?|submission\s+(?:deadline|closes?|closing)|proposal\s+(?:submission|deadline)|abstract\s+(?:submission|deadline)|presentation\s+(?:submission|deadline)|speaker\s+(?:deadline|submission)|judging\s+(?:panel\s+announced|window)|team\s+formation|full\s+specification\s+published|write\s*up\s+quest\s+closes?|winners?\s+announced)/ig;
-
-  const matches = [...flat.matchAll(milestoneRegex)];
-  for (let i = 0; i < matches.length; i++) {
-    const match = matches[i];
-    const label = match[0];
-    const start = (match.index ?? 0) + label.length;
-    const end = matches[i + 1]?.index ?? Math.min(flat.length, start + 220);
-    const window = flat.slice(start, end);
-
-    const dateMatch = window.match(dateRegex());
-    if (dateMatch?.[0]) {
-      addCandidate(label, dateMatch[0], i);
-    }
-  }
-
-  // 3) Sentence-style fallback.
-  // Example: "Code freeze and submission deadline: September 28, 2026".
-  const sentenceRegex =
-    /((?:registration|application|hackathon|event|submission|proposal|abstract|presentation|speaker|judging|team formation|full specification|code freeze|write\s*up quest|winners?)[^.!?\n]{0,100}?)(?:on|by|until|at|:)\s*((?:\d{1,2}\s+[A-Za-z]+(?:,?\s+\d{4})?|[A-Za-z]+\s+\d{1,2}(?:,?\s+\d{4})?|\d{4}-\d{2}-\d{2}|\d{1,2}[\/-]\d{1,2}[\/-]\d{4}))/gi;
-
-  for (const match of flat.matchAll(sentenceRegex)) {
-    if (match[1] && match[2]) addCandidate(match[1], match[2], 10000);
-  }
-
-  // 4) Deduplicate by logical milestone.
-  // Prefer a later announced value for the same milestone, but do not let a
-  // different milestone replace it.
-  const best = new Map<string, typeof candidates[number]>();
-  for (const candidate of candidates) {
-    const existing = best.get(candidate.key);
-    if (
-      !existing ||
-      candidate.date > existing.date ||
-      (candidate.date === existing.date && candidate.priority > existing.priority)
-    ) {
-      best.set(candidate.key, candidate);
-    }
-  }
-
-  return [...best.values()]
-    .sort((a, b) => a.date.localeCompare(b.date))
-    .slice(0, 30)
-    .map(({ key: _key, priority: _priority, order: _order, ...deadline }) => deadline);
+  return chunks.join('\n').trim();
 }
-function extractRequirements(text: string, sourceUrl?: string): AnalyzedRequirement[] {
-  const normalizedText = decodeHtml(text).replace(/\u00a0/g, ' ');
-  const lines = normalizedText.split(/\r?\n/).map(cleanText).filter(Boolean);
-  const found = new Map<string, AnalyzedRequirement>();
 
-  const sectionHeading =
-    /^(?:what you need to submit|what to submit|submission checklist|submission requirements?|requirements?|deliverables?|documents required|judging criteria|evaluation criteria|eligibility|rules?)$/i;
+const GEMINI_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    event: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        name: { type: 'string' },
+        type: {
+          type: 'string',
+          enum: [...EVENT_TYPE_VALUES],
+        },
+        description: { type: 'string' },
+        organizer: { type: 'string' },
+        location: { type: 'string' },
+        participation: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            minMembers: { type: ['integer', 'null'] },
+            maxMembers: { type: ['integer', 'null'] },
+            individualAllowed: { type: ['boolean', 'null'] },
+            details: { type: ['string', 'null'] },
+          },
+          required: ['minMembers', 'maxMembers', 'individualAllowed', 'details'],
+        },
+      },
+      required: ['name', 'type', 'description', 'organizer', 'location', 'participation'],
+    },
+    deadlines: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          title: { type: 'string' },
+          date: { type: 'string' },
+          verified: { type: 'boolean' },
+        },
+        required: ['title', 'date', 'verified'],
+      },
+    },
+    primaryDeadline: {
+      type: ['object', 'null'],
+      additionalProperties: false,
+      properties: {
+        date: { type: ['string', 'null'] },
+        title: { type: ['string', 'null'] },
+      },
+      required: ['date', 'title'],
+    },
+    requirements: {
+      type: 'array',
+      items: { type: 'string' },
+    },
+    resources: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          name: { type: 'string' },
+          type: { type: 'string', enum: ['template', 'document', 'link'] },
+          fileType: { type: 'string' },
+          url: { type: 'string' },
+        },
+        required: ['name', 'type', 'fileType', 'url'],
+      },
+    },
+    confidence: {
+      type: 'string',
+      enum: ['high', 'medium', 'low'],
+    },
+    notes: {
+      type: 'array',
+      items: { type: 'string' },
+    },
+  },
+  required: ['event', 'deadlines', 'primaryDeadline', 'requirements', 'resources', 'confidence', 'notes'],
+};
 
-  const addRequirement = (value: string, requiredBy: string) => {
-    // Some event platforms (React/Next.js single-page apps) occasionally leak
-    // a raw internal JS/JSON config into the page's visible text — e.g.
-    // `...your final project"},assessment:{label:"Assessment / Quiz",icon:...`.
-    // Cut the candidate off at the first sign of that (a brace, or a
-    // compact `key:value` code token with no space after the colon) so a
-    // leaked fragment can only ever contribute its clean leading text —
-    // never the raw code — to a requirement.
-    const codeMarkerIndex = value.search(/[{}[\]]|"\s*[,}]|\b\w+:(?=\S)/);
-    const trimmedValue = codeMarkerIndex >= 0 ? value.slice(0, codeMarkerIndex) : value;
+function buildExtractionPrompt(url: string): string {
+  return `You are EventPilot's event-source extraction engine.
 
-    const candidate = cleanText(
-      trimmedValue
-        .replace(/^[\s•*\-–—✓✔☐☑\d.)]+/, '')
-        .replace(/\s+/g, ' ')
-        .trim()
+Open and inspect the supplied public event URL carefully. Extract reliable facts directly from that source. The input is ONE event URL:
+${url}
+
+The application must work for arbitrary public event URLs, not one platform or one event.
+
+Use the supplied URL as the primary source. If the URL is unavailable, incomplete, dynamically rendered, or does not expose enough information, use Google Search only to locate additional public information about the SAME event. Prefer the official event page or organizer source over third-party pages.
+
+Do not invent facts. If a field is not explicitly supported by the source, return null/empty rather than guessing.
+
+Extract:
+- event name/title
+- event type: hackathon, competition, conference, or workshop
+- concise description
+- organizer if present
+- location / online / offline information if present
+- explicit team size minimum and maximum
+- whether solo/individual participation is explicitly allowed
+- all important official timeline milestones
+- the primary actionable deadline, prioritizing final submission/project due/code freeze; registration/application deadline is only the fallback when no submission deadline exists
+- submission requirements/deliverables
+- linked rulebooks, guidelines, templates, problem statements, starter kits, documentation and other useful event resources
+
+IMPORTANT deadline rules:
+- Preserve each milestone separately.
+- Do not use the latest chronological date blindly.
+- Do not convert judging, winner announcement, or post-submission dates into the submission deadline.
+- If the page contains a registration deadline and a later submission deadline, keep both and use submission as primary.
+- If the event only has an application/registration deadline, use that as primary.
+- Dates may appear as '25 Sep\\'26', '25 Sep 2026', 'Sep 25, 2026', ISO dates, etc. Normalize returned deadline.date to YYYY-MM-DD.
+
+IMPORTANT team rules:
+- Preserve ranges exactly. Example: '1-4 members' => minMembers=1, maxMembers=4.
+- Never average a range.
+- individualAllowed=true only when solo/individual participation is explicitly allowed.
+
+IMPORTANT requirements/resources rules:
+- Return individual requirements, not one giant paragraph.
+- Only return linked resources that actually exist on the source or a directly supporting official page.
+
+Return ONLY JSON matching the supplied schema.`;
+}
+
+async function callGeminiWebExtraction(url: string): Promise<GeminiExtraction | null> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+
+  try {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body: JSON.stringify({
+        model: GEMINI_MODEL,
+        input: buildExtractionPrompt(url),
+        tools: [
+          { type: 'url_context' },
+          { type: 'google_search' },
+        ],
+        response_format: {
+          type: 'text',
+          mime_type: 'application/json',
+          schema: GEMINI_SCHEMA,
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const details = await response.text().catch(() => '');
+      console.log(
+        `[event-analysis] Gemini web extraction failed: HTTP ${response.status}${details ? ` ${details.slice(0, 500)}` : ''}`
+      );
+      return null;
+    }
+
+    const data = await response.json();
+    const outputText = getInteractionOutputText(data);
+    if (!outputText) {
+      console.log('[event-analysis] Gemini returned no structured extraction output.');
+      return null;
+    }
+
+    const parsed = extractJsonFromText(outputText);
+    if (!parsed || typeof parsed !== 'object') {
+      console.log('[event-analysis] Gemini output was not valid JSON.');
+      return null;
+    }
+
+    return parsed as GeminiExtraction;
+  } catch (error) {
+    console.log(
+      `[event-analysis] Gemini web extraction error: ${
+        error instanceof Error ? error.message : String(error)
+      }`
     );
-
-    if (candidate.length < 4 || candidate.length > 220) return;
-    if (!/[A-Za-z]/.test(candidate)) return;
-
-    // Anything that still contains leftover code/JSON punctuation (stray
-    // braces, brackets, or a quote butted up against a closing paren/comma)
-    // is not a real requirement — reject it outright rather than show it.
-    if (/[{}[\]]|"\)|",$/.test(candidate)) return;
-
-    if (/^(requirements?|eligibility|submission|details?|rules?|guidelines?|judging criteria|evaluation criteria)$/i.test(candidate)) {
-      return;
-    }
-
-    const key = candidate.toLowerCase();
-    if (!found.has(key)) {
-      found.set(key, {
-        title: candidate,
-        completed: false,
-        requiredBy,
-        ...(sourceUrl ? { sourceLink: sourceUrl } : {}),
-        verified: true,
-      });
-    }
-  };
-
-  // 1) Line-oriented sections.
-  let inSection = false;
-  let remaining = 0;
-  let sectionTitle = 'Event Requirements';
-
-  for (const line of lines) {
-    const isHeading = sectionHeading.test(line) ||
-      /what you need to submit|submission requirements?|submission checklist|deliverables?|documents required/i.test(line) && line.length < 140;
-
-    if (isHeading) {
-      inSection = true;
-      sectionTitle = line;
-      remaining = 40;
-      continue;
-    }
-
-    if (inSection) {
-      if (remaining-- <= 0) {
-        inSection = false;
-        continue;
-      }
-
-      if (/^(important dates|timeline|schedule|contact|faq|about|prizes?|register|registration)\b/i.test(line)) {
-        inSection = false;
-        continue;
-      }
-
-      addRequirement(line, sectionTitle);
-    }
+    return null;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  // 2) Flattened Unstop/React text.
-  // Capture content after "What You Need to Submit" until the next major
-  // section heading. Split common bullet markers and punctuation into items.
-  const flat = cleanText(normalizedText);
-  const flattenedSection =
-    /what\s+you\s+need\s+to\s+submit|what\s+to\s+submit|submission\s+requirements?|submission\s+checklist/i;
-
-  const sectionMatch = flat.match(flattenedSection);
-  if (sectionMatch && sectionMatch.index !== undefined) {
-    const start = sectionMatch.index + sectionMatch[0].length;
-    const tail = flat.slice(start);
-    const stop =
-      tail.search(/\b(?:important dates|timeline|judging criteria|prizes?|eligibility|about hackathon|faq|contact)\b/i);
-    const section = tail.slice(0, stop >= 0 ? stop : 1800);
-
-    for (const item of section.split(/\s*(?:•|·|▪|◦|\||;)\s*/)) {
-      addRequirement(item, sectionMatch[0]);
-    }
-  }
-
-  // 3) Explicit instruction sentences.
-  const instructionRegex =
-    /(?:must\s+(?:submit|provide|upload)|submit|provide|upload|include|requires?)\s+([^.;]{4,180})/gi;
-
-  for (const match of flat.matchAll(instructionRegex)) {
-    const candidate = match[1]?.trim();
-    if (!candidate) continue;
-    if (/^(your|the)\s+(application|details|information)$/i.test(candidate)) continue;
-    addRequirement(candidate, 'Submission Instructions');
-  }
-
-  return [...found.values()].slice(0, 40);
-}
-function extractResources(html: string, sourceUrl: string): AnalyzedResource[] {
-  const found = new Map<string, AnalyzedResource>();
-  const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-  let match: RegExpExecArray | null;
-  while ((match = anchorRegex.exec(html)) !== null) {
-    const href = match[1].trim();
-    const name = cleanText(match[2]);
-    if (!name || name.length < 3 || name.length > 140) continue;
-    if (!/guideline|rulebook|rules|template|problem statement|starter|handbook|brochure|schedule|resource|download|brief|kit/i.test(name)) continue;
-    let absolute: string;
-    try { absolute = new URL(href, sourceUrl).toString(); } catch { continue; }
-    const lower = `${name} ${absolute}`.toLowerCase();
-    const isTemplate = /template|starter|kit|boilerplate/.test(lower);
-    const isDocument = /pdf|guideline|rulebook|rules|handbook|brief|brochure|problem statement|schedule/.test(lower);
-    found.set(absolute, {
-      name,
-      type: isTemplate ? 'template' : isDocument ? 'document' : 'link',
-      fileType: /\.pdf(?:$|[?#])/i.test(absolute) ? 'PDF' : isTemplate ? 'Template' : 'URL',
-      source: 'Extracted from event page',
-      url: absolute,
-    });
-  }
-  return [...found.values()].slice(0, 20);
-}
-
-function extractDescription(html: string): string {
-  return extractMeta(html, 'og:description') || extractMeta(html, 'description') || '';
-}
-
-function extractStructuredDates(html: string): string[] {
-  const dates: string[] = [];
-  const jsonLdRegex = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  let match: RegExpExecArray | null;
-  while ((match = jsonLdRegex.exec(html)) !== null) {
-    try {
-      const parsed = JSON.parse(match[1]);
-      const stack = Array.isArray(parsed) ? parsed : [parsed];
-      for (const item of stack) {
-        if (!item || typeof item !== 'object') continue;
-        for (const key of ['startDate', 'endDate', 'validThrough', 'expires']) {
-          if (typeof item[key] === 'string') dates.push(item[key]);
-        }
-      }
-    } catch {
-      // Some pages contain malformed JSON-LD; the visible-text extractor is still useful.
-    }
-  }
-  return dates;
 }
 
 async function fetchUrl(url: string): Promise<{ html: string; finalUrl: string }> {
   let parsed: URL;
-  try { parsed = new URL(url); } catch { throw new Error('Please enter a valid http(s) event URL.'); }
-  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only http(s) event URLs are supported.');
+
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error('Please enter a valid http(s) event URL.');
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('Only http(s) event URLs are supported.');
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
   try {
     const response = await fetch(parsed.toString(), {
       signal: controller.signal,
       redirect: 'follow',
       headers: {
-        // Many event platforms (Unstop, Devpost, Cloudflare-protected sites, etc.)
-        // block requests from an obviously-non-browser User-Agent like
-        // "EventPilot/1.0" with a 403/999. Presenting as a normal desktop
-        // Chrome request drastically reduces false "could not fetch" failures.
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36',
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
       },
     });
-    if (!response.ok) throw new Error(`The event page returned HTTP ${response.status}.`);
+
+    if (!response.ok) {
+      throw new Error(`The event page returned HTTP ${response.status}.`);
+    }
+
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
-      throw new Error('That URL did not return an HTML event page. Upload the document or use Add Manually instead.');
+      throw new Error('That URL did not return an HTML event page.');
     }
+
     const contentLength = Number(response.headers.get('content-length') || 0);
-    if (contentLength > MAX_SOURCE_BYTES) throw new Error('The event page is too large to analyze.');
+    if (contentLength > MAX_SOURCE_BYTES) {
+      throw new Error('The event page is too large to analyze.');
+    }
+
     const html = await response.text();
-    if (Buffer.byteLength(html, 'utf8') > MAX_SOURCE_BYTES) throw new Error('The event page is too large to analyze.');
-    return { html, finalUrl: response.url || parsed.toString() };
+    if (Buffer.byteLength(html, 'utf8') > MAX_SOURCE_BYTES) {
+      throw new Error('The event page is too large to analyze.');
+    }
+
+    return {
+      html,
+      finalUrl: response.url || parsed.toString(),
+    };
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') throw new Error('The event page took too long to respond. Try again or use the event PDF/manual entry.');
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('The event page took too long to respond.');
+    }
     throw error;
   } finally {
     clearTimeout(timer);
@@ -688,395 +756,163 @@ async function fetchUrl(url: string): Promise<{ html: string; finalUrl: string }
 
 async function renderUrl(url: string): Promise<{ html: string; text: string; finalUrl: string }> {
   let browser: any;
-  try {
-    // The browser is installed locally inside the deployed Playwright package.
-    // Set this before requiring Playwright so its executable lookup uses the
-    // same location that the postinstall script populated.
-    process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
 
-    // Playwright is intentionally loaded lazily so text-only analysis and
-    // normal HTML pages do not pay the browser startup cost.
+  try {
+    process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
     const playwright = require('playwright');
+
     browser = await playwright.chromium.launch({
       headless: true,
-      // Most hosting platforms (Render, Railway, Docker containers in
-      // general, etc.) run the Node process as root inside a container
-      // without the kernel namespaces Chromium's sandbox needs. Without
-      // these flags, launch() throws "No usable sandbox!" in production
-      // even though it works fine on a local dev machine. --disable-dev-shm-usage
-      // avoids a separate crash on hosts with a tiny /dev/shm.
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+      ],
     });
+
     const page = await browser.newPage({
       viewport: { width: 1440, height: 1200 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36 EventPilot/1.0',
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36',
     });
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await page.waitForLoadState('networkidle', { timeout: 12_000 }).catch(() => undefined);
 
-    // Many event platforms (React/Next.js) render the page shell immediately
-    // but fetch the actual timeline/team-size data from an API afterwards.
-    // A fixed short pause can grab the page mid-load, before that data
-    // exists in the DOM, which then looks like "nothing was found" even
-    // though the page has the info a second later. Poll innerText for a
-    // signal that real event content (a date-like or "team"/"deadline"
-    // keyword) is present, up to ~7s, instead of trusting a single pause.
-    const contentSignal = /\b(20\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i;
-    let bodyText = '';
-    for (let attempt = 0; attempt < 6; attempt++) {
-      bodyText = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
-      if (contentSignal.test(bodyText) && /team|deadline|registration|submission/i.test(bodyText)) break;
+    await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 35_000,
+    });
+
+    await page
+      .waitForLoadState('networkidle', { timeout: 15_000 })
+      .catch(() => undefined);
+
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const text = await page
+        .locator('body')
+        .innerText({ timeout: 5_000 })
+        .catch(() => '');
+
+      if (
+        text.trim().length >= 500 &&
+        !/^loading(?:\s+event)?\.{0,3}$/i.test(text.trim())
+      ) {
+        const html = await page.content();
+        return {
+          html: html.slice(0, MAX_SOURCE_BYTES),
+          text: text.slice(0, MAX_SOURCE_BYTES),
+          finalUrl: page.url() || url,
+        };
+      }
+
       await page.waitForTimeout(1_000);
     }
+
+    const text = await page
+      .locator('body')
+      .innerText({ timeout: 5_000 })
+      .catch(() => '');
     const html = await page.content();
+
     return {
       html: html.slice(0, MAX_SOURCE_BYTES),
-      // innerText is the authoritative rendered text. React/event platforms often
-      // use <span>/<button> nodes without block-level closing tags, so stripHtml()
-      // can flatten labels and dates into one noisy line. Playwright innerText
-      // preserves the visual timeline structure and fixes that regression.
-      text: bodyText.slice(0, MAX_SOURCE_BYTES),
+      text: text.slice(0, MAX_SOURCE_BYTES),
       finalUrl: page.url() || url,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+
     if (/Cannot find module ['"]playwright['"]/.test(message)) {
-      throw new Error('This event page needs browser rendering. Run "npm install" in server and then "npx playwright install chromium" once.');
+      throw new Error('Playwright is not installed on the server.');
     }
+
     if (/Executable doesn't exist|download new browsers/i.test(message)) {
-      throw new Error('The Chromium browser used to read JS-rendered event pages is missing on this server. Run "npx playwright install --with-deps chromium" in the server directory and redeploy.');
+      throw new Error('Chromium is not installed on the server.');
     }
+
     if (/error while loading shared libraries|missing dependencies|libnss3|libatk/i.test(message)) {
-      throw new Error('The server is missing system libraries Chromium needs. Run "npx playwright install-deps chromium" (or use a base image with those libraries) and redeploy.');
+      throw new Error('The server is missing Chromium system libraries.');
     }
+
     throw new Error(`The event page could not be rendered: ${message}`);
   } finally {
-    if (browser) await browser.close().catch(() => undefined);
+    if (browser) {
+      await browser.close().catch(() => undefined);
+    }
   }
 }
 
-// --- LLM-assisted extraction --------------------------------------------
-// Regex parsing is fast and free but brittle against every possible layout
-// a site can use. When a Gemini API key is configured, use it as a second
-// pass over the SAME already-fetched page text (no extra site visit) to
-// pull out deadlines / team size / requirements more reliably. This never
-// replaces the regex pass — it only fills gaps, and it is skipped entirely
-// (falling back to regex-only, exactly as before) if no key is set or the
-// call fails for any reason.
-type LlmExtraction = {
-  deadlines: AnalyzedDeadline[];
-  teamSizeMin?: number;
-  teamSizeMax?: number;
-  individualAllowed?: boolean;
-  participationDetails?: string;
-  requirements?: string[];
-};
+function buildFromGemini(
+  extraction: GeminiExtraction,
+  sourceUrl: string,
+  rawHtml: string,
+  sourceText: string
+): EventAnalysisResult {
+  const title = cleanText(String(extraction.event?.name ?? '')) || fallbackTitle(rawHtml, sourceUrl);
+  const description = cleanText(String(extraction.event?.description ?? '')) ||
+    cleanText(extractMeta(rawHtml, 'og:description') || extractMeta(rawHtml, 'description') || '') ||
+    sourceText.slice(0, 700);
 
-async function extractWithLLM(pageText: string, eventTitle: string): Promise<LlmExtraction | null> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
+  const eventType = EVENT_TYPE_VALUES.includes(extraction.event?.type as any)
+    ? (extraction.event?.type as EventAnalysisResult['event']['type'])
+    : inferType(`${title}\n${description}\n${sourceText}`);
 
-  const today = new Date().toISOString().slice(0, 10);
-  const trimmedText = pageText.slice(0, 12_000);
+  const deadlines = cleanDeadlines(extraction.deadlines);
+  const requirements = cleanRequirements(extraction.requirements, sourceUrl);
+  const resources = cleanResources(extraction.resources, sourceUrl);
 
-  const prompt = `You are extracting structured facts from the text of an event/hackathon registration page. Today's date is ${today}. Event title: "${eventTitle}".
-
-Read the page text below and return ONLY a JSON object (no markdown, no commentary) with this exact shape:
-{
-  "deadlines": [ { "title": string, "date": "YYYY-MM-DD" } ],
-  "teamSizeMin": number or null,
-  "teamSizeMax": number or null,
-  "individualAllowed": boolean or null,
-  "participationDetails": string or null,
-  "requirements": [string]
-}
-
-Rules:
-- Only include a deadline/date if it is literally present in the text (registration opens/closes, submission deadline, event start/end, etc.). Never invent a date.
-- If a date has no year in the text, infer the nearest sensible future/past year using today's date as context.
-- teamSizeMin/teamSizeMax come from an explicit team size statement (e.g. "Team Size: 2-4 Members", "Teams of 2-4"). If none is stated, use null for both.
-- individualAllowed is true only if solo participation is explicitly allowed.
-- requirements is a short list of submission/eligibility requirements explicitly stated on the page (max 10 items). Use an empty array if none.
-- Do not include any text outside the JSON object.
-
-PAGE TEXT:
-"""
-${trimmedText}
-"""`;
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20_000);
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: 'application/json', temperature: 0 },
-        }),
-        signal: controller.signal,
-      }
-    ).finally(() => clearTimeout(timeout));
-
-    if (!res.ok) {
-      console.log(`[event-analysis] Gemini extraction skipped: HTTP ${res.status}`);
-      return null;
-    }
-    const data: any = await res.json();
-    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (typeof rawText !== 'string') return null;
-
-    const parsed = JSON.parse(rawText);
-
-    const deadlines: AnalyzedDeadline[] = Array.isArray(parsed.deadlines)
-      ? parsed.deadlines
-          .map((d: any) => {
-            const parsedDate = parseDateCandidate(String(d?.date ?? ''));
-            if (!parsedDate) return null;
-            return {
-              title: cleanText(String(d?.title ?? 'Deadline')).slice(0, 120) || 'Deadline',
-              date: normalizeDate(parsedDate),
-              type: 'official' as const,
-              verified: true,
-            };
-          })
-          .filter((d: AnalyzedDeadline | null): d is AnalyzedDeadline => d !== null)
-      : [];
-
-    const teamSizeMinRaw = Number(parsed.teamSizeMin);
-    const teamSizeMaxRaw = Number(parsed.teamSizeMax);
-    const teamSizeMin = Number.isFinite(teamSizeMinRaw) && teamSizeMinRaw > 0 ? Math.round(teamSizeMinRaw) : undefined;
-    const teamSizeMax =
-      Number.isFinite(teamSizeMaxRaw) && teamSizeMaxRaw > 0
-        ? Math.max(teamSizeMin ?? 1, Math.round(teamSizeMaxRaw))
-        : undefined;
-
-    const requirements = Array.isArray(parsed.requirements)
-      ? parsed.requirements.map((r: any) => cleanText(String(r))).filter(Boolean).slice(0, 10)
-      : undefined;
-
-    return {
-      deadlines,
-      teamSizeMin,
-      teamSizeMax,
-      individualAllowed: typeof parsed.individualAllowed === 'boolean' ? parsed.individualAllowed : undefined,
-      participationDetails:
-        typeof parsed.participationDetails === 'string' && parsed.participationDetails.trim()
-          ? cleanText(parsed.participationDetails).slice(0, 200)
-          : undefined,
-      requirements,
-    };
-  } catch (error) {
-    console.log(`[event-analysis] Gemini extraction failed: ${error instanceof Error ? error.message : error}`);
-    return null;
-  }
-}
-
-export async function analyzeEventSource(input: string): Promise<EventAnalysisResult> {
-  const source = input.trim();
-  if (!source) throw new Error('Event source is required.');
-
-  let html = '';
-  let finalUrl: string | undefined;
-  let renderedText: string | undefined;
-  const looksLikeUrl = /^(?:https?:\/\/)?(?:www\.)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:[/:?#].*)?$/i.test(source);
-  const isUrl = looksLikeUrl;
-  const urlSource = /^https?:\/\//i.test(source) ? source : `https://${source}`;
-
-  if (isUrl) {
-    try {
-  const fetched = await fetchUrl(urlSource);
-  html = fetched.html;
-  finalUrl = fetched.finalUrl;
-
-  // Raw HTML from modern event platforms can contain partial/stale data.
-  // Render the page when the raw response is incomplete, even if it contains
-  // one unrelated date such as a registration deadline.
-  const rawText = repairSquashedWhitespace(stripHtml(html));
-  const rawDeadlines = extractDeadlines(rawText);
-  const rawRequirements = extractRequirements(rawText, finalUrl);
-  const rawParticipation = inferParticipation(
-    `${extractTitle(html, finalUrl)}\n${extractDescription(html)}\n${rawText}`
+  const participation = normalizeTeamSize(
+    extraction.event?.participation?.minMembers,
+    extraction.event?.participation?.maxMembers,
+    extraction.event?.participation?.individualAllowed
   );
 
-  const rawHasSubmissionDeadline = rawDeadlines.some((d) =>
-    /submission|code freeze|final submission/i.test(d.title) &&
-    !/registration/i.test(d.title)
-  );
+  const primaryDeadline = choosePrimaryDeadline(deadlines, extraction.primaryDeadline);
+  const notes = Array.isArray(extraction.notes)
+    ? extraction.notes.map((note) => cleanText(String(note))).filter(Boolean).slice(0, 10)
+    : [];
 
-  const rawHasUsefulTeamSize =
-    rawParticipation.teamSizeMax > 1 ||
-    rawParticipation.individualAllowed;
+  const warnings = [...notes];
 
-  const needsRenderedPage =
-    rawDeadlines.length === 0 ||
-    !rawHasSubmissionDeadline ||
-    rawRequirements.length === 0 ||
-    !rawHasUsefulTeamSize;
-
-  if (needsRenderedPage) {
-    console.log(
-      `[event-analysis] Raw page incomplete; rendering with Playwright ` +
-      `(deadlines=${rawDeadlines.length}, ` +
-      `submissionDeadline=${rawHasSubmissionDeadline}, ` +
-      `requirements=${rawRequirements.length}, ` +
-      `teamSizeMax=${rawParticipation.teamSizeMax})`
-    );
-
-    const rendered = await renderUrl(finalUrl);
-    html = rendered.html;
-    renderedText = rendered.text;
-    finalUrl = rendered.finalUrl;
-  }
-}
-    catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.log(`[event-analysis] Direct fetch failed, trying browser render: ${message}`);
-
-      const rendered = await renderUrl(urlSource);
-      html = rendered.html;
-      renderedText = rendered.text;
-      finalUrl = rendered.finalUrl;
-    }
-  } else {
-    // Text mode is intentionally limited to user-provided content; it never invents missing fields.
-    html = `<main>${source.replace(/\n/g, '<br>')}</main>`;
+  if (!primaryDeadline) {
+    warnings.push('No clearly labelled primary deadline was identified in the source.');
   }
 
-  const visibleText = repairSquashedWhitespace(renderedText?.trim() || stripHtml(html));
-  const firstTextLine = visibleText.split('\n').map(cleanText).find(Boolean) || 'Untitled Event';
-  const title = isUrl ? extractTitle(html, finalUrl) : firstTextLine.slice(0, 200);
-  const description = isUrl ? (extractDescription(html) || visibleText.slice(0, 500)) : visibleText.split('\n').slice(1).join(' ').slice(0, 5000);
-  const combined = `${title}\n${description}\n${visibleText}`;
-  const type = inferType(combined);
-  let deadlines = extractDeadlines(visibleText);
-  let requirements = extractRequirements(visibleText, finalUrl);
-  const resources = finalUrl ? extractResources(html, finalUrl) : [];
-  let participation = inferParticipation(combined);
-
-  // Second pass: ask Gemini over the SAME page text (no extra fetch) to catch
-  // whatever the regex patterns missed — e.g. squashed/reworded labels regex
-  // can't anticipate. Only fills in gaps; never overrides a field the regex
-  // pass already found something reasonable for, and is a total no-op if
-  // GEMINI_API_KEY isn't configured or the call fails.
-  const llmResult = await extractWithLLM(visibleText, title);
-  if (llmResult) {
-    if (deadlines.length === 0 && llmResult.deadlines.length > 0) {
-      deadlines = llmResult.deadlines;
-    }
-    if (participation.teamSizeMax <= 1 && !participation.individualAllowed &&
-        llmResult.teamSizeMin !== undefined && llmResult.teamSizeMax !== undefined) {
-      participation = {
-        teamSize: llmResult.teamSizeMin,
-        teamSizeMin: llmResult.teamSizeMin,
-        teamSizeMax: llmResult.teamSizeMax,
-        individualAllowed: llmResult.individualAllowed ?? participation.individualAllowed,
-        participationDetails: llmResult.participationDetails ?? `Teams of ${llmResult.teamSizeMin}-${llmResult.teamSizeMax}`,
-      };
-    }
-    if (requirements.length === 0 && llmResult.requirements && llmResult.requirements.length > 0) {
-      requirements = llmResult.requirements.map((text) => ({
-        title: text,
-        completed: false,
-        requiredBy: 'Event Requirements',
-        verified: true,
-      }));
-    }
+  if (!participation.known) {
+    warnings.push('No explicit team-size limit was identified in the source.');
   }
 
-  // JSON-LD dates are useful only as additional event dates. They are not labelled deadlines,
-  // so they never get silently converted into a submission deadline.
-  const structuredDates = extractStructuredDates(html)
-    .map((value) => parseDateCandidate(value)?.getTime())
-    .filter((value): value is number => Number.isFinite(value));
-
-  const deadlineWarnings: string[] = [];
-
-  if (deadlines.length === 0) {
-    // Previously this threw and forced the user into "Add Manually", even
-    // though the page usually has a real title, description, requirements,
-    // or team-size rules worth keeping. Fail soft instead: hand back
-    // everything else we found plus one unverified placeholder deadline
-    // (2 weeks out) that the confirm screen's editable date field lets the
-    // user fix in one click, rather than losing all extracted context.
-    if (structuredDates.length > 0) {
-      deadlineWarnings.push(
-        'I found event dates on the page, but none were clearly labelled as a registration or submission deadline — please verify the date below.'
-      );
-    } else {
-      deadlineWarnings.push(
-        'I could not find a clearly labelled deadline on that page — please verify the date below, or check the specific event/rules page for the exact date.'
-      );
-    }
-    const fallback = new Date();
-    fallback.setUTCDate(fallback.getUTCDate() + 14);
-    deadlines = [
-      {
-        title: 'Event Deadline (please verify)',
-        date: normalizeDate(fallback),
-        type: 'official',
-        verified: false,
-      },
-    ];
+  if (requirements.length === 0) {
+    warnings.push('No clear submission requirements or deliverables were identified.');
   }
 
-  // Prefer the actual submission/code-freeze milestone as the workspace's
-  // primary deadline. Registration deadlines and post-submission activities
-  // such as judging or winner announcements must not override it.
-  const submissionCandidates = deadlines.filter((d) =>
-    /submission|code freeze|final submission/i.test(d.title) &&
-    !/registration/i.test(d.title)
-  );
-
-  const deadlineCandidates = deadlines.filter((d) =>
-    /deadline|due|closing|close|last date/i.test(d.title) &&
-    !/registration/i.test(d.title)
-  );
-
-  const finalCandidates =
-    submissionCandidates.length > 0
-      ? submissionCandidates
-      : deadlineCandidates.length > 0
-        ? deadlineCandidates
-        : deadlines;
-
-  const finalDeadline = [...finalCandidates]
-    .sort((a, b) => a.date.localeCompare(b.date))
-    .at(-1)!.date;
-
-
-  const teamSize = participation.teamSize;
-
-  const warnings: string[] = [...deadlineWarnings];
-  if (!extractMeta(html, 'og:title') && !/<title/i.test(html)) warnings.push('Event name came from the page URL.');
-  if (requirements.length === 0) warnings.push('No clear requirements section was found; review the event page before creating the workspace.');
-  if (resources.length === 0) warnings.push('No linked guidelines/templates were detected on the page.');
-  if (participation.teamSizeMax === 1 && !participation.individualAllowed) {
-    warnings.push('No explicit team-size limit was detected.');
+  if (resources.length === 0) {
+    warnings.push('No linked guidelines, templates, or supporting resources were identified.');
   }
 
-  const hasVerifiedDeadline = deadlineWarnings.length === 0;
-  const confidenceScore = (hasVerifiedDeadline ? 1 : 0) + (requirements.length > 0 ? 1 : 0) + (resources.length > 0 ? 1 : 0) + (title !== 'Untitled Event' ? 1 : 0);
-  const overall: EventAnalysisResult['confidence']['overall'] = confidenceScore >= 4 ? 'high' : confidenceScore >= 2 ? 'medium' : 'low';
+  const overall = confidenceFrom(extraction.confidence, 'medium');
 
   return {
-    ...(finalUrl ? { sourceUrl: finalUrl } : {}),
-    sourceType: isUrl ? 'url' : 'text',
+    sourceUrl,
+    sourceType: 'url',
     event: {
       name: title,
-      type,
+      type: eventType,
       description: description.slice(0, 5000),
       status: 'on-track',
-      finalDeadline,
+      finalDeadline: primaryDeadline,
       progress: 0,
       healthScore: 100,
-      teamSize,
-      teamSizeMin: participation.teamSizeMin,
-      teamSizeMax: participation.teamSizeMax,
+      teamSize: participation.teamSize,
+      teamSizeMin: participation.min,
+      teamSizeMax: participation.max,
       individualAllowed: participation.individualAllowed,
-      participationDetails: participation.participationDetails,
+      participationDetails:
+        cleanText(String(extraction.event?.participation?.details ?? '')) ||
+        (participation.known
+          ? participation.individualAllowed
+            ? `Individual or teams of ${participation.min}–${participation.max} members`
+            : `Teams of ${participation.min}–${participation.max} members`
+          : 'Team size not explicitly detected'),
       nextAction: 'Review extracted event details before creating the workspace',
     },
     deadlines,
@@ -1086,10 +922,169 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
     confidence: {
       overall,
       event: title !== 'Untitled Event' ? 'high' : 'low',
-      deadlines: hasVerifiedDeadline ? 'high' : 'low',
+      deadlines: deadlines.length > 0 ? 'high' : 'low',
       requirements: requirements.length > 0 ? 'high' : 'low',
       resources: resources.length > 0 ? 'high' : 'low',
     },
     warnings,
   };
+}
+
+function fallbackFromPage(
+  sourceUrl: string,
+  rawHtml: string,
+  renderedText: string
+): EventAnalysisResult {
+  const text = cleanText(renderedText || stripHtml(rawHtml));
+  const title = fallbackTitle(rawHtml, sourceUrl);
+  const description = cleanText(extractMeta(rawHtml, 'og:description') || extractMeta(rawHtml, 'description') || '') || text.slice(0, 700);
+  const eventType = inferType(`${title}\n${description}\n${text}`);
+  const deadlineDate = text.match(/\b(?:20\d{2}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/20\d{2})\b/)?.[0];
+  const normalized = deadlineDate ? normalizeDateValue(deadlineDate) : null;
+
+  const deadlines: AnalyzedDeadline[] = normalized
+    ? [{
+        title: 'Event date (verify)',
+        date: normalized,
+        type: 'official',
+        verified: false,
+      }]
+    : [];
+
+  return {
+    sourceUrl,
+    sourceType: 'url',
+    event: {
+      name: title,
+      type: eventType,
+      description: description.slice(0, 5000),
+      status: 'on-track',
+      finalDeadline: normalized || '',
+      progress: 0,
+      healthScore: 100,
+      teamSize: 1,
+      teamSizeMin: 1,
+      teamSizeMax: 1,
+      individualAllowed: false,
+      participationDetails: 'Team size not explicitly detected',
+      nextAction: 'Review extracted event details before creating the workspace',
+    },
+    deadlines,
+    requirements: [],
+    resources: [],
+    teamMembers: [],
+    confidence: {
+      overall: 'low',
+      event: title !== 'Untitled Event' ? 'medium' : 'low',
+      deadlines: normalized ? 'low' : 'low',
+      requirements: 'low',
+      resources: 'low',
+    },
+    warnings: [
+      'AI web extraction was unavailable or failed; only limited source parsing was possible.',
+      'Review all extracted details before creating the workspace.',
+    ],
+  };
+}
+
+export async function analyzeEventSource(input: string): Promise<EventAnalysisResult> {
+  const source = input.trim();
+  if (!source) throw new Error('Event source is required.');
+
+  const looksLikeUrl = /^(?:https?:\/\/)?(?:www\.)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:[/:?#].*)?$/i.test(source);
+  const isUrl = looksLikeUrl;
+
+  if (!isUrl) {
+    const title = source.split(/\r?\n/).map(cleanText).find(Boolean) || 'Untitled Event';
+    const description = source.split(/\r?\n/).map(cleanText).filter(Boolean).slice(1).join(' ').slice(0, 5000);
+
+    return {
+      sourceType: 'text',
+      event: {
+        name: title.slice(0, 200),
+        type: inferType(source),
+        description,
+        status: 'on-track',
+        finalDeadline: '',
+        progress: 0,
+        healthScore: 100,
+        teamSize: 1,
+        teamSizeMin: 1,
+        teamSizeMax: 1,
+        individualAllowed: false,
+        participationDetails: 'Team size not explicitly detected',
+        nextAction: 'Review extracted event details before creating the workspace',
+      },
+      deadlines: [],
+      requirements: [],
+      resources: [],
+      teamMembers: [],
+      confidence: {
+        overall: 'low',
+        event: 'medium',
+        deadlines: 'low',
+        requirements: 'low',
+        resources: 'low',
+      },
+      warnings: ['Text analysis is limited; provide an event URL for richer extraction.'],
+    };
+  }
+
+  const urlSource = /^https?:\/\//i.test(source) ? source : `https://${source}`;
+
+  let rawHtml = '';
+  let finalUrl = urlSource;
+  let renderedText = '';
+
+  try {
+    const fetched = await fetchUrl(urlSource);
+    rawHtml = fetched.html;
+    finalUrl = fetched.finalUrl;
+  } catch (error) {
+    console.log(
+      `[event-analysis] Direct fetch failed; continuing with browser/AI: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+
+  /*
+   * AI-first path:
+   * Gemini's URL Context + Google Search can inspect arbitrary public event
+   * pages and return one structured result. This is the main extraction path.
+   */
+  const geminiResult = await callGeminiWebExtraction(finalUrl);
+
+  if (geminiResult) {
+    const pageText = rawHtml ? stripHtml(rawHtml) : '';
+    return buildFromGemini(geminiResult, finalUrl, rawHtml, pageText);
+  }
+
+  /*
+   * Fallback path:
+   * If the web model is unavailable, retain browser rendering so the existing
+   * deployment still has a chance to analyze dynamic pages.
+   */
+  try {
+    const rendered = await renderUrl(finalUrl);
+    renderedText = rendered.text;
+    rawHtml = rendered.html;
+    finalUrl = rendered.finalUrl;
+  } catch (error) {
+    console.log(
+      `[event-analysis] Browser fallback failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+
+  const text = renderedText.trim() || stripHtml(rawHtml);
+
+  if (!text.trim() || /^loading(?:\s+event)?\.{0,3}$/i.test(text.trim())) {
+    throw new Error(
+      'I could not read enough public information from that event URL. Please check that the page is publicly accessible, or provide the official event/rules page.'
+    );
+  }
+
+  return fallbackFromPage(finalUrl, rawHtml, text);
 }
