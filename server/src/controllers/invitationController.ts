@@ -3,12 +3,10 @@ import { EventInvitation, INVITABLE_ROLES } from '../models/EventInvitation';
 import { EventMembership } from '../models/EventMembership';
 import { Event } from '../models/Event';
 import { User } from '../models/User';
-import { Notification } from '../models/Notification';
 import { AppError, asyncHandler } from '../middleware/errorMiddleware';
 import { AuthedRequest } from '../middleware/authMiddleware';
 import { loadAuthorizedEvent, ensureEventMember, isValidObjectId } from '../utils/eventAccess';
-import { sendTeamInvitationEmail, isEmailConfigured } from '../services/emailService';
-import { env } from '../config/env';
+import { Notification } from '../models/Notification';
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -35,17 +33,20 @@ export const createInvitation = asyncHandler(async (req: AuthedRequest, res: Res
 
   const normalizedEmail = String(email).toLowerCase().trim();
 
-  // Already on the team? Don't send a redundant invite.
+  // In-app requests can only be delivered to an existing EventPilot account.
   const existingUser = await User.findOne({ email: normalizedEmail });
-  if (existingUser) {
-    const existingMembership = await EventMembership.findOne({
-      eventId: event._id,
-      userId: existingUser._id,
-      status: 'active',
-    });
-    if (existingMembership) {
-      throw new AppError('This person is already on the team', 409, 'CONFLICT');
-    }
+  if (!existingUser) {
+    throw new AppError('No EventPilot account exists for this email. Ask them to create an account first.', 404, 'NOT_FOUND');
+  }
+
+  // Already on the team? Don't create a redundant request.
+  const existingMembership = await EventMembership.findOne({
+    eventId: event._id,
+    userId: existingUser._id,
+    status: 'active',
+  });
+  if (existingMembership) {
+    throw new AppError('This person is already on the team', 409, 'CONFLICT');
   }
 
   const existingInvite = await EventInvitation.findOne({
@@ -65,52 +66,23 @@ export const createInvitation = asyncHandler(async (req: AuthedRequest, res: Res
   });
 
   const inviter = await User.findById(req.userId).select('name');
-  let emailSent = false;
-  try {
-    emailSent = await sendTeamInvitationEmail({
-      to: normalizedEmail,
-      eventName: event.name,
-      inviterName: inviter?.name || 'A teammate',
-      role: role || 'member',
-      appUrl: env.clientUrl,
+
+  // Invitations are delivered inside EventPilot. If the target already has
+  // an account, create a real, actionable notification in that user's inbox.
+  // No email is required for the team-request flow.
+  {
+    await Notification.create({
+      userId: existingUser._id,
+      eventId: event._id,
+      title: 'Team Invitation',
+      message: `${inviter?.name || 'A teammate'} invited you to join ${event.name} as ${role || 'member'}.`,
+      type: 'info',
+      invitationId: invitation._id,
+      createdBy: req.userId,
     });
-  } catch (error) {
-    console.warn('[email] Team invitation email failed:', error instanceof Error ? error.message : error);
-  }
-  if (!isEmailConfigured()) {
-    // Not an error — just tells whoever is reading the server logs why no
-    // invite email went out, instead of it silently looking like nothing happened.
-    console.warn('[email] SMTP is not configured (SMTP_HOST/SMTP_USER/SMTP_PASSWORD). Invitation emails will not be delivered until it is set.');
   }
 
-  // The invited person previously had NO way to find out about the invite unless
-  // the invitation email actually arrived (and it silently never did whenever SMTP
-  // wasn't configured, or landed in spam). If they already have an EventPilot
-  // account, also drop a real in-app notification into their account so they see
-  // it in the Notifications tab the next time they log in, regardless of email delivery.
-  if (existingUser) {
-    try {
-      await Notification.create({
-        userId: existingUser._id,
-        eventId: event._id,
-        title: 'New team invitation',
-        message: `${inviter?.name || 'A teammate'} invited you to join ${event.name} as ${role || 'member'}. Open your invitations to accept or decline.`,
-        type: 'info',
-        createdBy: req.userId,
-      });
-    } catch (error) {
-      console.warn('[notification] Failed to create in-app invitation notification:', error instanceof Error ? error.message : error);
-    }
-  }
-
-  res.status(201).json({
-    success: true,
-    data: {
-      invitation: invitation.toJSON(),
-      emailSent,
-      emailConfigured: isEmailConfigured(),
-    },
-  });
+  res.status(201).json({ success: true, data: { invitation: invitation.toJSON() } });
 });
 
 export const listEventInvitations = asyncHandler(async (req: AuthedRequest, res: Response) => {
@@ -192,21 +164,15 @@ export const acceptInvitation = asyncHandler(async (req: AuthedRequest, res: Res
   invitation.status = 'accepted';
   await invitation.save();
 
-  // Let the person who sent the invite know it was accepted — previously
-  // the inviter had no way to find out short of manually re-checking the
-  // team list.
-  try {
-    await Notification.create({
-      userId: invitation.invitedByUserId,
-      eventId: event._id,
-      title: 'Invitation accepted',
-      message: `${user.name || user.email} accepted your invite and joined ${event.name}.`,
-      type: 'success',
-      createdBy: req.userId,
-    });
-  } catch (error) {
-    console.warn('[notification] Failed to notify inviter of accepted invitation:', error instanceof Error ? error.message : error);
-  }
+  const acceptedUser = await User.findById(req.userId).select('name');
+  await Notification.create({
+    userId: invitation.invitedByUserId,
+    eventId: event._id,
+    title: 'Team Invitation Accepted',
+    message: `${acceptedUser?.name || 'A teammate'} accepted your invitation to join ${event.name}.`,
+    type: 'success',
+    createdBy: req.userId,
+  });
 
   res.json({ success: true, data: { membership: membership!.toJSON() } });
 });
@@ -230,6 +196,17 @@ export const declineInvitation = asyncHandler(async (req: AuthedRequest, res: Re
   if (invitation.status === 'pending') {
     invitation.status = 'declined';
     await invitation.save();
+
+    const declinedUser = await User.findById(req.userId).select('name');
+    const event = await Event.findById(invitation.eventId).select('name');
+    await Notification.create({
+      userId: invitation.invitedByUserId,
+      eventId: invitation.eventId,
+      title: 'Team Invitation Declined',
+      message: `${declinedUser?.name || 'A teammate'} declined your invitation${event?.name ? ` to join ${event.name}` : ''}.`,
+      type: 'warning',
+      createdBy: req.userId,
+    });
   }
 
   res.json({ success: true, data: null });

@@ -1,9 +1,35 @@
 import React from 'react';
 import { Bell, Check, X, ShieldAlert, AlertTriangle, Info, CheckCircle2 } from 'lucide-react';
+import { useState } from 'react';
 import { useStore } from '../store/storeContext';
+import { membershipService } from '../services/membershipService';
 
 export const Notifications: React.FC = () => {
-  const { notifications, events, markNotificationRead, clearNotifications } = useStore();
+  const { notifications, events, markNotificationRead, clearNotifications, refreshNotifications, notificationsLoading, notificationsError } = useStore();
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const handleInvitation = async (notificationId: string, invitationId: string, action: 'accept' | 'decline') => {
+    setActionLoading(notificationId);
+    setActionError(null);
+    try {
+      const result = action === 'accept'
+        ? await membershipService.acceptInvitation(invitationId)
+        : await membershipService.declineInvitation(invitationId);
+
+      if (!result.success) {
+        setActionError(result.error || 'Could not update the team request.');
+        return;
+      }
+
+      markNotificationRead(notificationId);
+      await refreshNotifications();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not update the team request.');
+    } finally {
+      setActionLoading(null);
+    }
+  };
 
   const getAlertIcon = (type: string) => {
     switch (type) {
@@ -48,6 +74,22 @@ export const Notifications: React.FC = () => {
           </button>
         )}
       </div>
+
+      {notificationsLoading && (
+        <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Loading notifications…</div>
+      )}
+      {(notificationsError || actionError) && (
+        <div style={{
+          padding: '10px 14px',
+          borderRadius: '8px',
+          border: '1px solid rgba(239, 68, 68, 0.2)',
+          background: 'rgba(239, 68, 68, 0.08)',
+          color: '#ef4444',
+          fontSize: '0.8rem'
+        }}>
+          {actionError || notificationsError}
+        </div>
+      )}
 
       {/* Feed list */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
@@ -126,6 +168,27 @@ export const Notifications: React.FC = () => {
                   <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '0.15rem', lineHeight: '1.4' }}>
                     {n.message}
                   </p>
+
+                  {n.invitationId && !n.read && (
+                    <div style={{ display: 'flex', gap: '8px', marginTop: '12px', flexWrap: 'wrap' }}>
+                      <button
+                        onClick={() => handleInvitation(n.id, n.invitationId!, 'accept')}
+                        disabled={actionLoading === n.id}
+                        className="btn btn-primary"
+                        style={{ padding: '7px 14px', fontSize: '12px', borderRadius: '7px' }}
+                      >
+                        {actionLoading === n.id ? 'Updating…' : 'Accept'}
+                      </button>
+                      <button
+                        onClick={() => handleInvitation(n.id, n.invitationId!, 'decline')}
+                        disabled={actionLoading === n.id}
+                        className="btn btn-secondary"
+                        style={{ padding: '7px 14px', fontSize: '12px', borderRadius: '7px' }}
+                      >
+                        Decline
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 {/* Mark read button control */}

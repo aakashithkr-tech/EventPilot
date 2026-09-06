@@ -89,6 +89,7 @@ export interface Notification {
   timestamp: string; // e.g. "2h ago" or "Yesterday"
   read: boolean;
   milestoneKey?: string; // deduplication key for preparation-aware smart alerts
+  invitationId?: string; // actionable team invitation notification
 }
 
 export interface ConnectedSource {

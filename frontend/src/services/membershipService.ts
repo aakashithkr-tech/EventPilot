@@ -37,18 +37,18 @@ class MembershipService {
     }
   }
 
-  /** Invite someone by email to join an event's team. */
+  /** Create an in-app team invitation for an existing EventPilot account. */
   async inviteUser(
     eventId: string,
     email: string,
     role: MembershipRole = 'member'
-  ): Promise<{ success: boolean; invitation?: EventInvitation; emailSent?: boolean; emailConfigured?: boolean; error?: string }> {
+  ): Promise<{ success: boolean; invitation?: EventInvitation; error?: string }> {
     try {
-      const result = await api.post<{ invitation: EventInvitation; emailSent: boolean; emailConfigured: boolean }>(
-        `/events/${eventId}/invitations`,
-        { email, role }
-      );
-      return { success: true, invitation: result.invitation, emailSent: result.emailSent, emailConfigured: result.emailConfigured };
+      const result = await api.post<{ invitation: EventInvitation }>(`/events/${eventId}/invitations`, {
+        email,
+        role,
+      });
+      return { success: true, invitation: result.invitation };
     } catch (err) {
       return { success: false, error: errorMessage(err) };
     }

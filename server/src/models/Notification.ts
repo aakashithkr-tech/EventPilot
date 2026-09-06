@@ -18,6 +18,8 @@ export interface INotification extends Document {
    * never spams duplicates even across server restarts/multiple callers.
    */
   milestoneKey?: string;
+  /** Present when this notification represents an actionable team invitation. */
+  invitationId?: Types.ObjectId;
   createdBy?: Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
@@ -32,6 +34,7 @@ const notificationSchema = new Schema<INotification>(
     type: { type: String, enum: ['critical', 'warning', 'info', 'success'], required: true },
     read: { type: Boolean, default: false },
     milestoneKey: { type: String, trim: true, maxlength: 200 },
+    invitationId: { type: Schema.Types.ObjectId, ref: 'EventInvitation', index: true },
     createdBy: { type: Schema.Types.ObjectId, ref: 'User' },
   },
   { timestamps: true }
@@ -68,6 +71,7 @@ notificationSchema.set('toJSON', {
     ret.eventId = ret.eventId?.toString?.() ?? ret.eventId;
     ret.userId = ret.userId?.toString?.() ?? ret.userId;
     ret.createdBy = ret.createdBy?.toString?.() ?? ret.createdBy;
+    ret.invitationId = ret.invitationId?.toString?.() ?? ret.invitationId;
     ret.timestamp = ret.createdAt instanceof Date ? formatRelativeTime(ret.createdAt) : 'Just now';
     if (!ret.milestoneKey) delete ret.milestoneKey;
     delete ret._id;

@@ -30,8 +30,6 @@ export const InviteMemberModal: React.FC<InviteMemberModalProps> = ({
   const [error, setError] = useState('');
   const [success, setSuccess] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [emailWarning, setEmailWarning] = useState('');
-  const [sentToEmail, setSentToEmail] = useState('');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -53,25 +51,15 @@ export const InviteMemberModal: React.FC<InviteMemberModalProps> = ({
 
       if (result.success) {
         setSuccess(true);
-        setSentToEmail(email);
-        setEmailWarning(
-          result.emailConfigured === false
-            ? "The server isn't configured to send emails yet (no SMTP set up), so no email went out. If they already have an EventPilot account, they'll still see this invite under their Notifications and Invitations once they log in."
-            : result.emailSent === false
-            ? 'The invitation was created, but the email could not be delivered. Double-check the address, or have them check their EventPilot Notifications tab.'
-            : ''
-        );
         setEmail('');
         setRole('member');
 
-        // Auto-close after a bit longer when there's a warning to read
+        // Auto-close after 2 seconds
         setTimeout(() => {
           onClose();
           setSuccess(false);
-          setEmailWarning('');
-          setSentToEmail('');
           if (onSuccess) onSuccess();
-        }, result.emailConfigured === false || result.emailSent === false ? 5000 : 2000);
+        }, 2000);
       } else {
         setError(result.error || 'Could not send the invitation. Please try again.');
       }
@@ -121,7 +109,7 @@ export const InviteMemberModal: React.FC<InviteMemberModalProps> = ({
               Invite Member
             </h2>
             <p style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
-              Add a team member to <strong>{eventName}</strong>
+              Send an in-app team request for <strong>{eventName}</strong>
             </p>
           </div>
           <button
@@ -152,12 +140,7 @@ export const InviteMemberModal: React.FC<InviteMemberModalProps> = ({
             alignItems: 'center',
             gap: '8px'
           }}>
-            ✓ Invitation sent to {sentToEmail}
-            {emailWarning && (
-              <div style={{ marginTop: '6px', color: '#f59e0b', display: 'block' }}>
-                {emailWarning}
-              </div>
-            )}
+            ✓ Invitation sent to {email}
           </div>
         )}
 
@@ -191,7 +174,7 @@ export const InviteMemberModal: React.FC<InviteMemberModalProps> = ({
               textTransform: 'uppercase',
               letterSpacing: '0.5px'
             }}>
-              Email Address
+              Account Email
             </label>
             <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
               <Mail size={16} style={{
