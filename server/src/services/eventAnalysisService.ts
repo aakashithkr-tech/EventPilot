@@ -93,6 +93,20 @@ function cleanText(value: string): string {
   return decodeHtml(value).replace(/\s+/g, ' ').trim();
 }
 
+// Some sites render small UI pieces (badges/pills, an icon next to a label)
+// as adjacent inline nodes with no whitespace between them, so the browser's
+// visible text comes out as "TeamSize2-4Members" instead of "Team Size 2-4
+// Members". Every keyword/date regex below relies on real word boundaries,
+// so a single squashed run can silently hide an otherwise-perfect match.
+// Insert a space at the obvious boundaries (lower→upper case, letter→digit,
+// digit→letter) as a cheap safety net before running extraction.
+function repairSquashedWhitespace(value: string): string {
+  return value
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/([A-Za-z])(\d)/g, '$1 $2')
+    .replace(/(\d)([A-Za-z])/g, '$1 $2');
+}
+
 function extractMeta(html: string, key: string): string | undefined {
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const patterns = [
@@ -699,8 +713,21 @@ async function renderUrl(url: string): Promise<{ html: string; text: string; fin
     });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await page.waitForLoadState('networkidle', { timeout: 12_000 }).catch(() => undefined);
-    await page.waitForTimeout(1_500);
-    const bodyText = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
+
+    // Many event platforms (React/Next.js) render the page shell immediately
+    // but fetch the actual timeline/team-size data from an API afterwards.
+    // A fixed short pause can grab the page mid-load, before that data
+    // exists in the DOM, which then looks like "nothing was found" even
+    // though the page has the info a second later. Poll innerText for a
+    // signal that real event content (a date-like or "team"/"deadline"
+    // keyword) is present, up to ~7s, instead of trusting a single pause.
+    const contentSignal = /\b(20\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i;
+    let bodyText = '';
+    for (let attempt = 0; attempt < 6; attempt++) {
+      bodyText = await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '');
+      if (contentSignal.test(bodyText) && /team|deadline|registration|submission/i.test(bodyText)) break;
+      await page.waitForTimeout(1_000);
+    }
     const html = await page.content();
     return {
       html: html.slice(0, MAX_SOURCE_BYTES),
@@ -748,7 +775,7 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
   // Raw HTML from modern event platforms can contain partial/stale data.
   // Render the page when the raw response is incomplete, even if it contains
   // one unrelated date such as a registration deadline.
-  const rawText = stripHtml(html);
+  const rawText = repairSquashedWhitespace(stripHtml(html));
   const rawDeadlines = extractDeadlines(rawText);
   const rawRequirements = extractRequirements(rawText, finalUrl);
   const rawParticipation = inferParticipation(
@@ -799,7 +826,7 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
     html = `<main>${source.replace(/\n/g, '<br>')}</main>`;
   }
 
-  const visibleText = renderedText?.trim() || stripHtml(html);
+  const visibleText = repairSquashedWhitespace(renderedText?.trim() || stripHtml(html));
   const firstTextLine = visibleText.split('\n').map(cleanText).find(Boolean) || 'Untitled Event';
   const title = isUrl ? extractTitle(html, finalUrl) : firstTextLine.slice(0, 200);
   const description = isUrl ? (extractDescription(html) || visibleText.slice(0, 500)) : visibleText.split('\n').slice(1).join(' ').slice(0, 5000);
