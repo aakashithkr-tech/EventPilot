@@ -481,6 +481,7 @@ async function fetchUrl(url: string): Promise<{ html: string; finalUrl: string }
 }
 
 async function renderUrl(url: string): Promise<{ html: string; text: string; finalUrl: string }> {
+  process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
   let browser: any;
   try {
     // Playwright is intentionally loaded lazily so text-only analysis and
@@ -528,25 +529,28 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
   const urlSource = /^https?:\/\//i.test(source) ? source : `https://${source}`;
 
   if (isUrl) {
+  try {
     const fetched = await fetchUrl(urlSource);
     html = fetched.html;
     finalUrl = fetched.finalUrl;
 
-    // Many modern event platforms (including pages whose HTML initially says
-    // only "Loading event...") populate the timeline through client-side JS.
-    // Use the normal fetch first, then browser-render only when the fetched
-    // page does not expose a clearly labelled deadline.
     if (extractDeadlines(stripHtml(html)).length === 0) {
       const rendered = await renderUrl(finalUrl);
       html = rendered.html;
       renderedText = rendered.text;
       finalUrl = rendered.finalUrl;
     }
-  } else {
-    // Text mode is intentionally limited to user-provided content; it never invents missing fields.
-    html = `<main>${source.replace(/\n/g, '<br>')}</main>`;
-  }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
 
+    console.log(`[event-analysis] Direct fetch failed, trying browser render: ${message}`);
+
+    const rendered = await renderUrl(urlSource);
+    html = rendered.html;
+    renderedText = rendered.text;
+    finalUrl = rendered.finalUrl;
+  }
+}
   const visibleText = renderedText?.trim() || stripHtml(html);
   const firstTextLine = visibleText.split('\n').map(cleanText).find(Boolean) || 'Untitled Event';
   const title = isUrl ? extractTitle(html, finalUrl) : firstTextLine.slice(0, 200);
