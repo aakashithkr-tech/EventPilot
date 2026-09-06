@@ -257,8 +257,9 @@ function extractDeadlineTitle(label: string): string {
 }
 
 function extractDeadlines(text: string): AnalyzedDeadline[] {
-  const lines = text.split(/\r?\n/).map(cleanText).filter(Boolean);
-  const sourceYear = inferSourceYear(text);
+  const normalizedText = decodeHtml(text).replace(/\u00a0/g, ' ');
+  const lines = normalizedText.split(/\r?\n/).map(cleanText).filter(Boolean);
+  const sourceYear = inferSourceYear(normalizedText);
   const candidates: Array<AnalyzedDeadline & { key: string; priority: number; order: number }> = [];
   const keyword = /registration|application|submission|deadline|closing|close|proposal|abstract|presentation|speaker|final|last date|due|event start|event end/i;
 
@@ -279,8 +280,7 @@ function extractDeadlines(text: string): AnalyzedDeadline[] {
     });
   };
 
-  // First handle labels and dates rendered on separate DOM lines. We allow a
-  // few intermediate UI lines, but never cross another semantic milestone.
+  // 1) Normal DOM structure: milestone label and date appear on nearby lines.
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!keyword.test(line)) continue;
@@ -291,35 +291,51 @@ function extractDeadlines(text: string): AnalyzedDeadline[] {
       continue;
     }
 
-    for (let offset = 1; offset <= 6; offset++) {
+    for (let offset = 1; offset <= 8; offset++) {
       const next = lines[i + offset];
       if (!next) break;
 
       const match = next.match(dateRegex());
-      if (match?.length) {
+      if (match?.[0]) {
+        // A date line may contain a time after it; parseDateCandidate only needs the date.
         addCandidate(line, match[0], i);
         break;
       }
 
-      // Ignore time-only rows such as "11:59 PM" and continue searching.
-      if (/^\s*\d{1,2}:\d{2}\s*(?:AM|PM)\s*$/i.test(next)) continue;
+      // Time-only DOM rows are not dates and must never be paired with another milestone.
+      if (/^\d{1,2}:\d{2}\s*(?:AM|PM)$/i.test(next)) continue;
 
-      // Another milestone means the previous label no longer owns later dates.
+      // Do not let one milestone steal another milestone's date.
       if (offset > 1 && keyword.test(next)) break;
     }
   }
 
-  // Catch flattened sentences such as "Registration closes on Sep 15, 2026".
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!keyword.test(line)) continue;
-    for (const rawDate of line.match(dateRegex()) || []) {
-      addCandidate(line, rawDate, i);
-    }
+  // 2) Flattened/SPA text fallback.
+  // Some React/Next event pages return body.innerText as one long string rather than
+  // preserving the visual timeline rows. In that case, pair each milestone label with
+  // the FIRST date occurring after it, stopping before another milestone label.
+  const flat = cleanText(normalizedText);
+  const milestoneRegex = /(registration\s+(?:opens?|open|starts?|begins?|closes?|closing|deadline)|application\s+(?:deadline|closes?|closing)|(?:event\s+)?starts?|(?:event\s+)?ends?|final\s+submission(?:\s+deadline)?|submission\s+deadline|proposal\s+(?:submission|deadline)|abstract\s+(?:submission|deadline)|presentation\s+(?:submission|deadline)|speaker\s+(?:deadline|submission))/ig;
+  const matches = [...flat.matchAll(milestoneRegex)];
+
+  for (let i = 0; i < matches.length; i++) {
+    const match = matches[i];
+    const label = match[0];
+    const start = (match.index ?? 0) + label.length;
+    const end = matches[i + 1]?.index ?? Math.min(flat.length, start + 180);
+    const window = flat.slice(start, end);
+    const dateMatch = window.match(dateRegex());
+    if (dateMatch?.[0]) addCandidate(label, dateMatch[0], i);
   }
 
-  // One canonical deadline per logical milestone. Repeated banners/cards are
-  // common on event sites, so keep the latest date and strongest label.
+  // 3) Common sentence form: "Registration closes on Sep 15, 2026, 11:59 PM".
+  const sentenceRegex = /(registration|application|submission|proposal|abstract|presentation|speaker|event)[^.!?\n]{0,100}?(?:on|by|until|:)?\s*(\d{1,2}\s+[A-Za-z]+(?:,?\s+\d{4})?|[A-Za-z]+\s+\d{1,2}(?:,?\s+\d{4})?|\d{4}-\d{2}-\d{2}|\d{1,2}[\/-]\d{1,2}[\/-]\d{4})/gi;
+  for (const match of flat.matchAll(sentenceRegex)) {
+    if (match[1] && match[2]) addCandidate(match[1], match[2], 10000);
+  }
+
+  // One canonical value per logical milestone. Prefer the latest announced date;
+  // when the date is identical, prefer the more specific/stronger label.
   const best = new Map<string, typeof candidates[number]>();
   for (const candidate of candidates) {
     const existing = best.get(candidate.key);
