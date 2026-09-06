@@ -271,22 +271,28 @@ function extractDeadlines(text: string): AnalyzedDeadline[] {
     const dateEntries: Array<{ raw: string; offset: number }> = sameLineDates.map((raw) => ({ raw, offset: 0 }));
 
     if (dateEntries.length === 0) {
-      for (let offset = 1; offset <= 2; offset++) {
-        const next = lines[i + offset];
-        if (!next) break;
-        // Stop at another semantic timeline label. This prevents
-        // "Registration Closes" from borrowing the opening time.
-        if (offset > 1 && keyword.test(next) && !new RegExp(dateRegex().source, 'i').test(next)) break;
-        const match = next.match(dateRegex());
-        if (match?.length) {
-          dateEntries.push({ raw: match[0], offset });
-          break;
-        }
-        // A time-only line is intentionally ignored; the Deadline model stores
-        // calendar dates and a stray time must never be attached to another label.
-        if (/\b\d{1,2}:\d{2}\s*(?:AM|PM)\b/i.test(next)) continue;
-      }
+  for (let offset = 1; offset <= 4; offset++) {
+    const next = lines[i + offset];
+    if (!next) break;
+
+    const match = next.match(dateRegex());
+
+    if (match?.length) {
+      dateEntries.push({ raw: match[0], offset });
+      break;
     }
+
+    // Ignore time-only lines, but keep looking for the actual calendar date.
+    if (/\b\d{1,2}:\d{2}\s*(?:AM|PM)\b/i.test(next)) {
+      continue;
+    }
+
+    // Stop if another semantic timeline label appears before a date.
+    if (offset > 1 && keyword.test(next)) {
+      break;
+    }
+  }
+}
 
     for (const entry of dateEntries) {
       const date = parseDateCandidate(entry.raw, sourceYear);
