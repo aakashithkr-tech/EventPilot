@@ -755,6 +755,125 @@ async function renderUrl(url: string): Promise<{ html: string; text: string; fin
   }
 }
 
+// --- LLM-assisted extraction --------------------------------------------
+// Regex parsing is fast and free but brittle against every possible layout
+// a site can use. When a Gemini API key is configured, use it as a second
+// pass over the SAME already-fetched page text (no extra site visit) to
+// pull out deadlines / team size / requirements more reliably. This never
+// replaces the regex pass — it only fills gaps, and it is skipped entirely
+// (falling back to regex-only, exactly as before) if no key is set or the
+// call fails for any reason.
+type LlmExtraction = {
+  deadlines: AnalyzedDeadline[];
+  teamSizeMin?: number;
+  teamSizeMax?: number;
+  individualAllowed?: boolean;
+  participationDetails?: string;
+  requirements?: string[];
+};
+
+async function extractWithLLM(pageText: string, eventTitle: string): Promise<LlmExtraction | null> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const trimmedText = pageText.slice(0, 12_000);
+
+  const prompt = `You are extracting structured facts from the text of an event/hackathon registration page. Today's date is ${today}. Event title: "${eventTitle}".
+
+Read the page text below and return ONLY a JSON object (no markdown, no commentary) with this exact shape:
+{
+  "deadlines": [ { "title": string, "date": "YYYY-MM-DD" } ],
+  "teamSizeMin": number or null,
+  "teamSizeMax": number or null,
+  "individualAllowed": boolean or null,
+  "participationDetails": string or null,
+  "requirements": [string]
+}
+
+Rules:
+- Only include a deadline/date if it is literally present in the text (registration opens/closes, submission deadline, event start/end, etc.). Never invent a date.
+- If a date has no year in the text, infer the nearest sensible future/past year using today's date as context.
+- teamSizeMin/teamSizeMax come from an explicit team size statement (e.g. "Team Size: 2-4 Members", "Teams of 2-4"). If none is stated, use null for both.
+- individualAllowed is true only if solo participation is explicitly allowed.
+- requirements is a short list of submission/eligibility requirements explicitly stated on the page (max 10 items). Use an empty array if none.
+- Do not include any text outside the JSON object.
+
+PAGE TEXT:
+"""
+${trimmedText}
+"""`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20_000);
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: 'application/json', temperature: 0 },
+        }),
+        signal: controller.signal,
+      }
+    ).finally(() => clearTimeout(timeout));
+
+    if (!res.ok) {
+      console.log(`[event-analysis] Gemini extraction skipped: HTTP ${res.status}`);
+      return null;
+    }
+    const data: any = await res.json();
+    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (typeof rawText !== 'string') return null;
+
+    const parsed = JSON.parse(rawText);
+
+    const deadlines: AnalyzedDeadline[] = Array.isArray(parsed.deadlines)
+      ? parsed.deadlines
+          .map((d: any) => {
+            const parsedDate = parseDateCandidate(String(d?.date ?? ''));
+            if (!parsedDate) return null;
+            return {
+              title: cleanText(String(d?.title ?? 'Deadline')).slice(0, 120) || 'Deadline',
+              date: normalizeDate(parsedDate),
+              type: 'official' as const,
+              verified: true,
+            };
+          })
+          .filter((d: AnalyzedDeadline | null): d is AnalyzedDeadline => d !== null)
+      : [];
+
+    const teamSizeMinRaw = Number(parsed.teamSizeMin);
+    const teamSizeMaxRaw = Number(parsed.teamSizeMax);
+    const teamSizeMin = Number.isFinite(teamSizeMinRaw) && teamSizeMinRaw > 0 ? Math.round(teamSizeMinRaw) : undefined;
+    const teamSizeMax =
+      Number.isFinite(teamSizeMaxRaw) && teamSizeMaxRaw > 0
+        ? Math.max(teamSizeMin ?? 1, Math.round(teamSizeMaxRaw))
+        : undefined;
+
+    const requirements = Array.isArray(parsed.requirements)
+      ? parsed.requirements.map((r: any) => cleanText(String(r))).filter(Boolean).slice(0, 10)
+      : undefined;
+
+    return {
+      deadlines,
+      teamSizeMin,
+      teamSizeMax,
+      individualAllowed: typeof parsed.individualAllowed === 'boolean' ? parsed.individualAllowed : undefined,
+      participationDetails:
+        typeof parsed.participationDetails === 'string' && parsed.participationDetails.trim()
+          ? cleanText(parsed.participationDetails).slice(0, 200)
+          : undefined,
+      requirements,
+    };
+  } catch (error) {
+    console.log(`[event-analysis] Gemini extraction failed: ${error instanceof Error ? error.message : error}`);
+    return null;
+  }
+}
+
 export async function analyzeEventSource(input: string): Promise<EventAnalysisResult> {
   const source = input.trim();
   if (!source) throw new Error('Event source is required.');
@@ -833,6 +952,39 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
   const combined = `${title}\n${description}\n${visibleText}`;
   const type = inferType(combined);
   let deadlines = extractDeadlines(visibleText);
+  let requirements = extractRequirements(visibleText, finalUrl);
+  const resources = finalUrl ? extractResources(html, finalUrl) : [];
+  let participation = inferParticipation(combined);
+
+  // Second pass: ask Gemini over the SAME page text (no extra fetch) to catch
+  // whatever the regex patterns missed — e.g. squashed/reworded labels regex
+  // can't anticipate. Only fills in gaps; never overrides a field the regex
+  // pass already found something reasonable for, and is a total no-op if
+  // GEMINI_API_KEY isn't configured or the call fails.
+  const llmResult = await extractWithLLM(visibleText, title);
+  if (llmResult) {
+    if (deadlines.length === 0 && llmResult.deadlines.length > 0) {
+      deadlines = llmResult.deadlines;
+    }
+    if (participation.teamSizeMax <= 1 && !participation.individualAllowed &&
+        llmResult.teamSizeMin !== undefined && llmResult.teamSizeMax !== undefined) {
+      participation = {
+        teamSize: llmResult.teamSizeMin,
+        teamSizeMin: llmResult.teamSizeMin,
+        teamSizeMax: llmResult.teamSizeMax,
+        individualAllowed: llmResult.individualAllowed ?? participation.individualAllowed,
+        participationDetails: llmResult.participationDetails ?? `Teams of ${llmResult.teamSizeMin}-${llmResult.teamSizeMax}`,
+      };
+    }
+    if (requirements.length === 0 && llmResult.requirements && llmResult.requirements.length > 0) {
+      requirements = llmResult.requirements.map((text) => ({
+        title: text,
+        completed: false,
+        requiredBy: 'Event Requirements',
+        verified: true,
+      }));
+    }
+  }
 
   // JSON-LD dates are useful only as additional event dates. They are not labelled deadlines,
   // so they never get silently converted into a submission deadline.
@@ -895,9 +1047,6 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
     .at(-1)!.date;
 
 
-  const requirements = extractRequirements(visibleText, finalUrl);
-  const resources = finalUrl ? extractResources(html, finalUrl) : [];
-  const participation = inferParticipation(combined);
   const teamSize = participation.teamSize;
 
   const warnings: string[] = [...deadlineWarnings];
