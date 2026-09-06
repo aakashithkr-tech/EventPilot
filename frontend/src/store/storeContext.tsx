@@ -11,8 +11,16 @@ import { resourceService, CreateResourcePayload } from '../services/resourceServ
 import { deadlineService, CreateDeadlinePayload } from '../services/deadlineService';
 import { eventUpdateService } from '../services/eventUpdateService';
 import { notificationService, CreateNotificationPayload } from '../services/notificationService';
+import { membershipService } from '../services/membershipService';
+import { EventInvitation } from '../types';
 import { ApiError } from '../services/api';
 import { useAuth } from './authContext';
+
+/** How often we quietly re-check for new notifications / team requests that
+ * arrived while this tab was already open. Team requests are otherwise only
+ * fetched once per login, so a teammate sitting on an open tab would never
+ * see an incoming request until they manually reloaded. */
+const LIVE_REFRESH_INTERVAL_MS = 15000;
 
 export interface DeadlineChangeToastData {
   eventName: string;
@@ -69,6 +77,11 @@ interface StoreContextType {
   /** Set when the last notifications fetch failed. Null otherwise. */
   notificationsError: string | null;
   refreshNotifications: () => void;
+  /** Pending team requests sent to this account's email, not yet accepted/declined. */
+  pendingInvitations: EventInvitation[];
+  pendingInvitationsLoading: boolean;
+  pendingInvitationsError: string | null;
+  refreshPendingInvitations: () => void;
   addEvent: (
     event: Omit<Event, 'id'>, 
     deadlines: Omit<Deadline, 'id' | 'eventId'>[], 
@@ -296,6 +309,64 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
     fetchNotifications();
   }, [isAuthReady, isAuthenticated, fetchNotifications]);
+
+  // Pending team requests sent to this account (Feature 3) — the same data
+  // GET /invitations/mine already exposes, just surfaced outside the
+  // Notifications tab too so a teammate who was invited sees it show up
+  // wherever they're looking, even before they've accepted.
+  const [pendingInvitations, setPendingInvitations] = useState<EventInvitation[]>([]);
+  const [pendingInvitationsLoading, setPendingInvitationsLoading] = useState(false);
+  const [pendingInvitationsError, setPendingInvitationsError] = useState<string | null>(null);
+
+  const fetchPendingInvitations = React.useCallback(async () => {
+    setPendingInvitationsLoading(true);
+    setPendingInvitationsError(null);
+    try {
+      const fetched = await membershipService.getPendingInvitationsForEmail('');
+      setPendingInvitations(fetched);
+    } catch (err) {
+      setPendingInvitationsError(err instanceof ApiError ? err.message : 'Failed to load team requests.');
+    } finally {
+      setPendingInvitationsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthReady) return;
+    if (!isAuthenticated) {
+      setPendingInvitations([]);
+      setPendingInvitationsError(null);
+      return;
+    }
+    fetchPendingInvitations();
+  }, [isAuthReady, isAuthenticated, fetchPendingInvitations]);
+
+  // Live refresh: notifications and pending team requests are otherwise only
+  // fetched once per login, so someone who was already sitting on the app
+  // when a teammate sent them a request would never see it arrive. Poll
+  // quietly in the background, and also re-check the moment the tab regains
+  // focus (covers switching back from another app/tab right after a request
+  // was sent).
+  useEffect(() => {
+    if (!isAuthReady || !isAuthenticated) return;
+
+    const tick = () => {
+      fetchNotifications();
+      fetchPendingInvitations();
+    };
+
+    const interval = setInterval(tick, LIVE_REFRESH_INTERVAL_MS);
+    const onFocus = () => tick();
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') tick();
+    });
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [isAuthReady, isAuthenticated, fetchNotifications, fetchPendingInvitations]);
 
   // Event Updates now live in MongoDB (Feature 8), scoped to real events —
   // not localStorage/mock data. Same fetch-per-event-set pattern as Deadlines.
@@ -827,6 +898,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         notificationsLoading,
         notificationsError,
         refreshNotifications: fetchNotifications,
+        pendingInvitations,
+        pendingInvitationsLoading,
+        pendingInvitationsError,
+        refreshPendingInvitations: fetchPendingInvitations,
         addEvent,
         updateEvent,
         removeEvent,

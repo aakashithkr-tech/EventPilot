@@ -9,10 +9,14 @@ import {
   Rocket,
   Trophy,
   Mic,
-  GraduationCap
+  GraduationCap,
+  UserPlus,
+  Check,
+  X
 } from 'lucide-react';
 import { useStore } from '../store/storeContext';
 import { Event, EventStatus, EventType } from '../types';
+import { membershipService } from '../services/membershipService';
 
 interface EventsProps {
   onSelectEvent: (id: string) => void;
@@ -28,13 +32,41 @@ const TYPE_ICON: Record<EventType, React.ElementType> = {
 };
 
 export const Events: React.FC<EventsProps> = ({ onSelectEvent, onOpenSources, onStartOnboarding }) => {
-  const { events, eventsLoading, eventsError, refreshEvents, updateEvent, removeEvent } = useStore();
+  const {
+    events, eventsLoading, eventsError, refreshEvents, updateEvent, removeEvent,
+    pendingInvitations, pendingInvitationsLoading, refreshPendingInvitations, refreshNotifications
+  } = useStore();
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | EventStatus>('all');
   const [typeFilter, setTypeFilter] = useState<'all' | EventType>('all');
   const [sortBy, setSortBy] = useState<'deadline' | 'progress' | 'name'>('deadline');
   const [actionEventId, setActionEventId] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [inviteActionId, setInviteActionId] = useState<string | null>(null);
+  const [inviteActionError, setInviteActionError] = useState<string | null>(null);
+
+  const respondToInvitation = async (invitationId: string, action: 'accept' | 'decline') => {
+    setInviteActionId(invitationId);
+    setInviteActionError(null);
+    try {
+      const result = action === 'accept'
+        ? await membershipService.acceptInvitation(invitationId)
+        : await membershipService.declineInvitation(invitationId);
+
+      if (!result.success) {
+        setInviteActionError(result.error || 'Could not update this team request.');
+        return;
+      }
+
+      refreshPendingInvitations();
+      refreshNotifications();
+      if (action === 'accept') refreshEvents();
+    } catch (err) {
+      setInviteActionError(err instanceof Error ? err.message : 'Could not update this team request.');
+    } finally {
+      setInviteActionId(null);
+    }
+  };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -134,6 +166,50 @@ export const Events: React.FC<EventsProps> = ({ onSelectEvent, onOpenSources, on
     'at-risk': events.filter(e => e.status === 'at-risk').length,
   }), [events]);
 
+  const pendingInvitesSection = pendingInvitations.length > 0 ? (
+    <div className="premium-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', padding: '1rem 1.15rem', border: '1px solid var(--primary)', background: 'var(--primary-glow)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', fontWeight: 700 }}>
+        <UserPlus size={16} style={{ color: 'var(--primary)' }} />
+        <span>Team requests waiting for you ({pendingInvitations.length})</span>
+      </div>
+      {inviteActionError && (
+        <div style={{ fontSize: '0.78rem', color: '#ef4444' }}>{inviteActionError}</div>
+      )}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+        {pendingInvitations.map(inv => (
+          <div key={inv.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap', padding: '0.6rem 0.75rem', borderRadius: 8, background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
+            <div>
+              <strong style={{ fontSize: '0.85rem' }}>{inv.event?.name || 'An event'}</strong>
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>
+                Invited as {inv.role}
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button
+                className="btn btn-primary"
+                style={{ padding: '0.4rem 0.75rem', fontSize: '0.75rem', gap: '0.3rem' }}
+                disabled={inviteActionId === inv.id}
+                onClick={() => void respondToInvitation(inv.id, 'accept')}
+              >
+                <Check size={13} />
+                {inviteActionId === inv.id ? 'Joining…' : 'Accept'}
+              </button>
+              <button
+                className="btn btn-secondary"
+                style={{ padding: '0.4rem 0.75rem', fontSize: '0.75rem', gap: '0.3rem' }}
+                disabled={inviteActionId === inv.id}
+                onClick={() => void respondToInvitation(inv.id, 'decline')}
+              >
+                <X size={13} />
+                Decline
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  ) : null;
+
   if (eventsLoading && events.length === 0) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '60vh', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
@@ -161,24 +237,28 @@ export const Events: React.FC<EventsProps> = ({ onSelectEvent, onOpenSources, on
 
   if (events.length === 0) {
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '60vh', textAlign: 'center' }}>
-        <div style={{ padding: '1rem', background: 'var(--primary-glow)', color: 'var(--primary)', borderRadius: '12px', marginBottom: '1.5rem' }}>
-          <Sparkles size={32} />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', maxWidth: '1100px' }}>
+        {pendingInvitesSection}
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '50vh', textAlign: 'center' }}>
+          <div style={{ padding: '1rem', background: 'var(--primary-glow)', color: 'var(--primary)', borderRadius: '12px', marginBottom: '1.5rem' }}>
+            <Sparkles size={32} />
+          </div>
+          <h2 style={{ fontSize: '1.35rem', fontWeight: 600, marginBottom: '0.5rem' }}>Your command center is quiet.</h2>
+          <p style={{ color: 'var(--text-secondary)', maxWidth: '380px', marginBottom: '1.5rem' }}>
+            Add your first event and let the AI handle the rest.
+          </p>
+          <button onClick={onStartOnboarding} className="btn btn-primary" style={{ gap: '0.5rem' }}>
+            <PlusCircle size={16} />
+            <span>Add Your First Event</span>
+          </button>
         </div>
-        <h2 style={{ fontSize: '1.35rem', fontWeight: 600, marginBottom: '0.5rem' }}>Your command center is quiet.</h2>
-        <p style={{ color: 'var(--text-secondary)', maxWidth: '380px', marginBottom: '1.5rem' }}>
-          Add your first event and let the AI handle the rest.
-        </p>
-        <button onClick={onStartOnboarding} className="btn btn-primary" style={{ gap: '0.5rem' }}>
-          <PlusCircle size={16} />
-          <span>Add Your First Event</span>
-        </button>
       </div>
     );
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem', maxWidth: '1100px' }}>
+      {pendingInvitesSection}
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '1rem' }}>
         <div>

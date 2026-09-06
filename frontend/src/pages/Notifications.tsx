@@ -5,7 +5,7 @@ import { useStore } from '../store/storeContext';
 import { membershipService } from '../services/membershipService';
 
 export const Notifications: React.FC = () => {
-  const { notifications, events, markNotificationRead, clearNotifications, refreshNotifications, notificationsLoading, notificationsError } = useStore();
+  const { notifications, events, markNotificationRead, clearNotifications, refreshNotifications, notificationsLoading, notificationsError, refreshEvents, refreshPendingInvitations } = useStore();
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -24,6 +24,11 @@ export const Notifications: React.FC = () => {
 
       markNotificationRead(notificationId);
       await refreshNotifications();
+      // Accepting adds this event to the roster; declining removes it from
+      // the pending-requests list — refresh both so the change is visible
+      // immediately wherever it's shown (Notifications tab + Events page).
+      refreshPendingInvitations();
+      if (action === 'accept') refreshEvents();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not update the team request.');
     } finally {
