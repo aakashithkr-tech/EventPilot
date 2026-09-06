@@ -726,18 +726,51 @@ export async function analyzeEventSource(input: string): Promise<EventAnalysisRe
 
   if (isUrl) {
     try {
-      const fetched = await fetchUrl(urlSource);
-      html = fetched.html;
-      finalUrl = fetched.finalUrl;
+  const fetched = await fetchUrl(urlSource);
+  html = fetched.html;
+  finalUrl = fetched.finalUrl;
 
-      // Many modern event platforms populate the timeline through client-side JS.
-      if (extractDeadlines(stripHtml(html)).length === 0) {
-        const rendered = await renderUrl(finalUrl);
-        html = rendered.html;
-        renderedText = rendered.text;
-        finalUrl = rendered.finalUrl;
-      }
-    } catch (error) {
+  // Raw HTML from modern event platforms can contain partial/stale data.
+  // Render the page when the raw response is incomplete, even if it contains
+  // one unrelated date such as a registration deadline.
+  const rawText = stripHtml(html);
+  const rawDeadlines = extractDeadlines(rawText);
+  const rawRequirements = extractRequirements(rawText, finalUrl);
+  const rawParticipation = inferParticipation(
+    `${extractTitle(html, finalUrl)}\n${extractDescription(html)}\n${rawText}`
+  );
+
+  const rawHasSubmissionDeadline = rawDeadlines.some((d) =>
+    /submission|code freeze|final submission/i.test(d.title) &&
+    !/registration/i.test(d.title)
+  );
+
+  const rawHasUsefulTeamSize =
+    rawParticipation.teamSizeMax > 1 ||
+    rawParticipation.individualAllowed;
+
+  const needsRenderedPage =
+    rawDeadlines.length === 0 ||
+    !rawHasSubmissionDeadline ||
+    rawRequirements.length === 0 ||
+    !rawHasUsefulTeamSize;
+
+  if (needsRenderedPage) {
+    console.log(
+      `[event-analysis] Raw page incomplete; rendering with Playwright ` +
+      `(deadlines=${rawDeadlines.length}, ` +
+      `submissionDeadline=${rawHasSubmissionDeadline}, ` +
+      `requirements=${rawRequirements.length}, ` +
+      `teamSizeMax=${rawParticipation.teamSizeMax})`
+    );
+
+    const rendered = await renderUrl(finalUrl);
+    html = rendered.html;
+    renderedText = rendered.text;
+    finalUrl = rendered.finalUrl;
+  }
+}
+    catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.log(`[event-analysis] Direct fetch failed, trying browser render: ${message}`);
 
