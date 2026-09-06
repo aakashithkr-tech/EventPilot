@@ -42,13 +42,13 @@ class MembershipService {
     eventId: string,
     email: string,
     role: MembershipRole = 'member'
-  ): Promise<{ success: boolean; invitation?: EventInvitation; error?: string }> {
+  ): Promise<{ success: boolean; invitation?: EventInvitation; emailSent?: boolean; emailConfigured?: boolean; error?: string }> {
     try {
-      const result = await api.post<{ invitation: EventInvitation }>(`/events/${eventId}/invitations`, {
-        email,
-        role,
-      });
-      return { success: true, invitation: result.invitation };
+      const result = await api.post<{ invitation: EventInvitation; emailSent: boolean; emailConfigured: boolean }>(
+        `/events/${eventId}/invitations`,
+        { email, role }
+      );
+      return { success: true, invitation: result.invitation, emailSent: result.emailSent, emailConfigured: result.emailConfigured };
     } catch (err) {
       return { success: false, error: errorMessage(err) };
     }
